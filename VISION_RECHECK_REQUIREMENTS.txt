@@ -1,0 +1,120 @@
+REQUIREMENTS — Targeted Per-Page Vision Re-Check for Large Documents
+Status: NOT YET BUILT — pending decision to proceed
+Written: 2026-08-27
+Related: EXTRACTION_GOLDEN_RULES.md, KV_CACHE_AND_VLLM_WORKFLOW.md
+
+================================================================
+1. PROBLEM
+================================================================
+Vision (page images sent alongside OCR text) is only attached to an
+extraction call when a document is small enough to qualify for the
+"vision-hybrid" path:
+
+    total OCR text <= SINGLE_SHOT_CHARS (80,000 chars)
+    AND page count  <= MAX_VISION_PAGES (10 pages)
+
+Any document larger than either limit falls to the text-only map-reduce
+path and gets ZERO visual signal at any point in its processing —
+including during self-correction, when the model is specifically being
+asked to fix an ambiguous or contaminated field. On a large document, the
+model has no way to actually look at the page to resolve that ambiguity;
+it can only re-guess from the same flattened OCR text that produced the
+ambiguity in the first place.
+
+This was raised directly by a user request: "Detect invoice table
+boundaries, rows, and columns before extracting line items; never rely
+only on flattened OCR text" and "If any field is ambiguous or
+contaminated, perform a targeted vision/LLM second pass using the
+original page image before returning the final JSON."
+
+================================================================
+2. GOAL
+================================================================
+When self-correction is triggered on a large (map-reduce path) document,
+and a specific flagged issue can be traced to a specific page, fetch
+ONLY that page's image and give the model a genuine visual second look
+at the relevant part of the document before finalizing the answer.
+
+Explicitly NOT the goal: sending every page's image for every large
+document by default. That would multiply image-token cost across
+potentially dozens of pages per document, on top of the existing
+map-reduce chunk-call cost. This must stay targeted and cheap.
+
+================================================================
+3. FUNCTIONAL REQUIREMENTS
+================================================================
+FR1. Page provenance tracking
+     Every chunk processed during map-reduce (_map_chunks()) must retain
+     which page range it came from, and that provenance must survive
+     into the final merged answer well enough that a specific line item
+     or field can be traced back to an approximate page number.
+     Currently _map_chunks() already labels findings with "pages {a}-{b}"
+     in the prompt text, but this is not carried into the parsed JSON
+     structure in any queryable way — needs a real mechanism (e.g. a
+     temporary internal "_source_page" hint per row that gets used for
+     targeting and then stripped before the response is returned).
+
+FR2. Issue -> page mapping
+     When validate_extraction() flags a hard issue tied to a specific
+     row/field (wrong_amount, wrong_column, invoice_number_missing,
+     vendor_missing, row_count_mismatch, etc.), determine which page(s)
+     that issue's row/field most likely belongs to, using the provenance
+     from FR1.
+
+FR3. On-demand single/few-page image fetch
+     Before the self-correction call, if FR2 resolved specific page(s),
+     extract just those page image(s) (reuse extract_page_images(),
+     scoped to the resolved page range only) and attach them to the
+     self-correction messages the same way vision-hybrid already does.
+     If FR2 cannot confidently resolve a page, fall back to today's
+     behavior (text-only self-correction, no images) rather than
+     guessing and attaching the wrong page.
+
+FR4. Cap on attached pages per self-correction call
+     Even when several issues are flagged, cap the number of distinct
+     page images attached to any single self-correction call (suggest:
+     3-5 pages) to keep the added token cost bounded and predictable.
+
+FR5. No change to small/vision-hybrid-eligible documents
+     Documents already under SINGLE_SHOT_CHARS/MAX_VISION_PAGES keep
+     their current behavior unchanged (they already get full vision
+     access, this feature doesn't need to touch that path).
+
+================================================================
+4. NON-GOALS
+================================================================
+- NOT a general-purpose CV table/column/row structure detector (no
+  bounding-box detection, no table-transformer model, no PP-Structure
+  integration). The model itself still does row/column interpretation;
+  this feature only gives it a second visual look at a narrower slice
+  of the document when something is already flagged as wrong.
+- NOT sending images for every large document by default.
+- NOT a fix for the underlying OCR quality itself.
+
+================================================================
+5. OPEN QUESTIONS (need a decision before/while building)
+================================================================
+Q1. How precise does page-attribution need to be? Exact page, or is a
+    2-3 page window (chunk boundary) acceptable?
+Q2. When an issue has no resolvable page (e.g. total_mismatch, which is
+    document-wide, not row-specific) — always fall back to text-only, or
+    attach the LAST page (totals are usually there)?
+Q3. Does this apply to /v1/extract, /files/ask, or both? (Recommend:
+    both, since they share answer_document()/the map-reduce helpers.)
+Q4. Does the added image-fetch + re-encode latency during self-correction
+    need its own progress/status event on /files/ask's streaming path?
+
+================================================================
+6. ROUGH SCOPE / RISK
+================================================================
+This is a real code change touching _map_chunks(), validate_extraction()
+issue records, _self_correct(), and both call sites (batch_extract(),
+files_ask()) — not a prompt-only fix. Estimate: moderate — the page-
+provenance tracking (FR1) is the part most likely to need iteration,
+since it has no existing scaffolding to build on.
+
+================================================================
+7. NEXT STEP
+================================================================
+Awaiting go-ahead to implement. No code changes made yet under this
+requirements doc.

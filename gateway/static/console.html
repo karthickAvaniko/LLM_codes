@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Avaniko AI — Console</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@500;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0b0b0f; --bg2:#0e0e14; --surface:#15151c; --surface2:#1c1c25; --hover:#23232e;
+  --border:#26262f; --border2:#30303c;
+  --text:#f4f4f8; --text2:#c5c5d2; --muted:#7e7e8f;
+  --accent:#8b5cf6; --accent2:#6d28d9; --accentSoft:rgba(139,92,246,.14);
+  --green:#22c55e; --greenSoft:rgba(34,197,94,.13);
+  --red:#f43f5e; --redSoft:rgba(244,63,94,.12);
+  --amber:#f59e0b;
+  --shadow:0 8px 30px rgba(0,0,0,.5); --shadowsm:0 2px 10px rgba(0,0,0,.35);
+  --radius:16px; --radius-sm:11px;
+}
+body.light{
+  --bg:#f4f5fa; --bg2:#eef0f7; --surface:#ffffff; --surface2:#f6f7fb; --hover:#eef0f7;
+  --border:#e6e8f0; --border2:#dadce8;
+  --text:#16161f; --text2:#3d3d4d; --muted:#7a7a8a;
+  --accentSoft:rgba(124,58,237,.10);
+  --greenSoft:rgba(34,197,94,.12); --redSoft:rgba(244,63,94,.10);
+  --shadow:0 12px 40px rgba(40,40,80,.12); --shadowsm:0 2px 10px rgba(40,40,80,.06);
+}
+html,body{min-height:100%}
+body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--text);
+  -webkit-font-smoothing:antialiased;transition:background .3s,color .3s;font-size:14px}
+h1,h2,h3,h4,.brand,.stat-val,.navitem{font-family:'Sora','Inter',sans-serif;letter-spacing:-.01em}
+svg{display:block}
+::-webkit-scrollbar{width:8px;height:8px}::-webkit-scrollbar-thumb{background:var(--border2);border-radius:8px}
+
+/* ============ LOGIN ============ */
+#login{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;position:relative;overflow:hidden}
+#login::before{content:"";position:absolute;width:600px;height:600px;border-radius:50%;
+  background:radial-gradient(circle,rgba(139,92,246,.22),transparent 65%);top:-180px;right:-120px;filter:blur(20px)}
+#login::after{content:"";position:absolute;width:480px;height:480px;border-radius:50%;
+  background:radial-gradient(circle,rgba(109,40,217,.18),transparent 65%);bottom:-160px;left:-100px;filter:blur(20px)}
+.login-card{position:relative;z-index:2;width:100%;max-width:410px;background:var(--surface);
+  border:1px solid var(--border);border-radius:24px;padding:38px 34px;box-shadow:var(--shadow);
+  animation:rise .5s cubic-bezier(.2,.8,.2,1)}
+@keyframes rise{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:none}}
+.login-logo{width:58px;height:58px;border-radius:17px;background:linear-gradient(135deg,#8b5cf6,#6d28d9);
+  display:flex;align-items:center;justify-content:center;color:#fff;font-weight:800;font-family:'Sora';
+  font-size:1.15rem;margin:0 auto 20px;box-shadow:0 8px 24px rgba(139,92,246,.4)}
+.login-card h1{text-align:center;font-size:1.5rem;font-weight:800}
+.login-card .tag{text-align:center;color:var(--muted);font-size:.86rem;margin:6px 0 26px}
+.field{margin-bottom:15px}
+.field label{display:block;font-size:.78rem;color:var(--text2);font-weight:500;margin-bottom:7px}
+.field input{width:100%;background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius-sm);
+  padding:13px 14px;color:var(--text);font-size:.92rem;outline:none;font-family:inherit;transition:.18s}
+.field input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accentSoft)}
+#login-err{color:var(--red);font-size:.8rem;min-height:1.2em;margin:8px 0 2px;text-align:center}
+.login-theme{position:absolute;top:20px;right:22px;z-index:3}
+
+/* ============ APP SHELL ============ */
+#app{display:none}
+#shell{display:flex;min-height:100vh}
+#side{width:248px;flex-shrink:0;background:var(--surface);border-right:1px solid var(--border);
+  display:flex;flex-direction:column;padding:20px 14px;position:sticky;top:0;height:100vh}
+.brand{display:flex;align-items:center;gap:11px;padding:4px 10px 22px;font-weight:800;font-size:1.08rem}
+.brand .logo{width:36px;height:36px;border-radius:11px;background:linear-gradient(135deg,#8b5cf6,#6d28d9);
+  display:flex;align-items:center;justify-content:center;color:#fff;font-weight:800;font-size:.82rem;
+  box-shadow:0 4px 14px rgba(139,92,246,.35)}
+.nav{display:flex;flex-direction:column;gap:3px}
+.navitem{display:flex;align-items:center;gap:12px;padding:11px 13px;border-radius:12px;cursor:pointer;
+  color:var(--muted);font-size:.9rem;font-weight:600;transition:.16s;position:relative}
+.navitem svg{width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:2}
+.navitem:hover{background:var(--hover);color:var(--text2)}
+.navitem.active{background:var(--accentSoft);color:var(--accent)}
+.navitem.active::before{content:"";position:absolute;left:-14px;top:50%;transform:translateY(-50%);
+  width:3px;height:20px;border-radius:0 3px 3px 0;background:var(--accent)}
+.side-bottom{margin-top:auto;display:flex;flex-direction:column;gap:7px;padding-top:14px;border-top:1px solid var(--border)}
+.userbox{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:12px;background:var(--bg2)}
+.avatar{width:32px;height:32px;border-radius:50%;background:linear-gradient(135deg,#8b5cf6,#6d28d9);
+  display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:.8rem;flex-shrink:0}
+.userbox .nm{font-size:.82rem;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.userbox .rl{font-size:.7rem;color:var(--muted)}
+.sbtn{display:flex;align-items:center;justify-content:center;gap:8px;background:none;border:1px solid var(--border);
+  border-radius:10px;color:var(--muted);cursor:pointer;padding:9px;font-size:.8rem;font-family:inherit;
+  text-decoration:none;transition:.16s}
+.sbtn:hover{border-color:var(--accent);color:var(--accent)}
+
+#main{flex:1;min-width:0;display:flex;flex-direction:column}
+.topbar{display:flex;align-items:center;gap:14px;padding:18px 30px;border-bottom:1px solid var(--border);
+  background:color-mix(in srgb,var(--surface) 80%,transparent);backdrop-filter:blur(8px);position:sticky;top:0;z-index:20}
+.topbar h2{font-size:1.18rem;font-weight:700}
+.topbar .crumb{color:var(--muted);font-size:.78rem;margin-top:2px}
+.topbar .sp{margin-left:auto}
+.iconbtn{display:inline-flex;align-items:center;gap:7px;background:none;border:1px solid var(--border);
+  border-radius:10px;color:var(--muted);cursor:pointer;padding:8px 12px;font-size:.82rem;font-family:inherit;transition:.16s}
+.iconbtn:hover{border-color:var(--accent);color:var(--accent)}
+.content{padding:28px 30px;max-width:1120px;width:100%;margin:0 auto}
+.page{display:none;flex-direction:column;gap:22px;animation:fade .35s ease}
+.page.show{display:flex}
+@keyframes fade{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+
+/* cards */
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:24px;box-shadow:var(--shadowsm)}
+.card-h{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:18px}
+.card h3{font-size:1.02rem;font-weight:700}
+.card .sub{color:var(--muted);font-size:.81rem;margin-top:3px}
+
+label.lbl{display:block;font-size:.78rem;color:var(--text2);font-weight:500;margin-bottom:7px}
+input,textarea,select{width:100%;background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius-sm);
+  padding:12px 14px;color:var(--text);font-size:.9rem;outline:none;font-family:inherit;transition:.18s}
+input:focus,textarea:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accentSoft)}
+select{cursor:pointer}select option{background:var(--surface);color:var(--text)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:14px}
+
+.btn{display:inline-flex;align-items:center;gap:8px;background:linear-gradient(135deg,var(--accent),var(--accent2));
+  border:none;border-radius:var(--radius-sm);color:#fff;padding:12px 22px;font-size:.88rem;font-weight:600;
+  cursor:pointer;font-family:inherit;transition:.16s;box-shadow:0 4px 14px rgba(139,92,246,.3)}
+.btn:hover{filter:brightness(1.08);transform:translateY(-1px)}
+.btn:active{transform:none}.btn:disabled{opacity:.55;cursor:wait;transform:none}
+.btn.ghost{background:none;border:1px solid var(--border);color:var(--text2);box-shadow:none}
+.btn.ghost:hover{border-color:var(--accent);color:var(--accent);filter:none}
+.btn.danger{background:none;border:1px solid var(--border);color:var(--red);padding:6px 13px;font-size:.77rem;box-shadow:none}
+.btn.danger:hover{border-color:var(--red);background:var(--redSoft)}
+
+/* stats */
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:16px}
+.stat{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:20px;
+  box-shadow:var(--shadowsm);position:relative;overflow:hidden}
+.stat::after{content:"";position:absolute;right:-20px;top:-20px;width:80px;height:80px;border-radius:50%;
+  background:var(--accentSoft);opacity:.6}
+.stat-val{display:block;font-size:1.75rem;font-weight:800;position:relative}
+.stat-lbl{font-size:.76rem;color:var(--muted);position:relative}
+
+/* table */
+.tablewrap{overflow-x:auto;border-radius:12px}
+table{width:100%;border-collapse:collapse;font-size:.84rem}
+th{color:var(--muted);font-weight:600;text-align:left;padding:11px 13px;border-bottom:1px solid var(--border);
+  font-size:.74rem;text-transform:uppercase;letter-spacing:.04em}
+td{padding:13px;border-bottom:1px solid var(--border);color:var(--text2)}
+tbody tr{transition:.12s}tbody tr:hover{background:var(--hover)}
+tr:last-child td{border-bottom:none}
+td code{font-family:'Fira Code',ui-monospace,monospace;font-size:.77rem;color:var(--text)}
+.badge{display:inline-flex;align-items:center;gap:5px;padding:3px 11px;border-radius:99px;font-size:.71rem;font-weight:600}
+.badge::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
+.badge.on{background:var(--greenSoft);color:var(--green)}
+.badge.off{background:var(--redSoft);color:var(--red)}
+.empty{color:var(--muted);text-align:center;padding:24px}
+
+.keybox{display:flex;gap:10px;align-items:center;background:var(--bg2);border:1px dashed var(--green);
+  border-radius:var(--radius-sm);padding:14px;margin-top:14px}
+.keybox code{flex:1;font-family:'Fira Code',monospace;font-size:.82rem;word-break:break-all;color:var(--green)}
+
+/* key cards (My API keys / admin Keys tab) */
+.keycards{display:flex;flex-direction:column;gap:14px}
+.keycard{background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:16px 18px}
+.keycard-h{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:10px}
+.keycard-h .kc-name{font-weight:700;font-size:.94rem}
+.keycard-h .kc-owner{color:var(--muted);font-size:.78rem;margin-left:8px;font-weight:400}
+.keycard .keybox{margin-top:0}
+.keycard .keybox code.nokey{color:var(--muted);font-style:italic}
+.kc-stats{display:flex;gap:18px;flex-wrap:wrap;margin-top:12px;font-size:.78rem;color:var(--muted)}
+.kc-stats b{color:var(--text2);font-weight:600}
+.kc-think{display:flex;align-items:center;gap:10px;margin-top:12px;padding-top:12px;border-top:1px solid var(--border)}
+.kc-think .tt{font-size:.83rem;font-weight:600;flex:1}
+.kc-think .ts{font-size:.74rem;color:var(--muted)}
+.switch{position:relative;display:inline-block;width:40px;height:23px;flex-shrink:0}
+.switch input{opacity:0;width:0;height:0}
+.switch .sl{position:absolute;cursor:pointer;inset:0;background:var(--border2);border-radius:999px;transition:.2s}
+.switch .sl::before{content:"";position:absolute;height:17px;width:17px;left:3px;bottom:3px;
+  background:#fff;border-radius:50%;transition:.2s}
+.switch input:checked+.sl{background:var(--accent)}
+.switch input:checked+.sl::before{transform:translateX(17px)}
+.switch input:disabled+.sl{cursor:not-allowed;opacity:.6}
+.kc-actions{display:flex;gap:8px}
+.warn{color:var(--amber);font-size:.78rem;margin-top:11px}
+#demo-out{background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:15px;
+  margin-top:14px;font-size:.88rem;white-space:pre-wrap;min-height:56px;line-height:1.55;color:var(--text2)}
+pre{background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:15px;overflow-x:auto;
+  font-size:.77rem;line-height:1.6;margin-top:12px;font-family:'Fira Code',monospace;color:var(--text2)}
+
+.toast{position:fixed;bottom:28px;left:50%;transform:translateX(-50%) translateY(10px);background:var(--surface);
+  border:1px solid var(--accent);border-radius:12px;padding:12px 22px;font-size:.85rem;font-weight:500;opacity:0;
+  transition:.3s;pointer-events:none;box-shadow:var(--shadow);z-index:99}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+#menu-btn{display:none}
+@media(max-width:780px){
+  #side{position:fixed;z-index:50;transform:translateX(-100%);transition:transform .22s;box-shadow:var(--shadow)}
+  #side.open{transform:translateX(0)}
+  #menu-btn{display:inline-flex}
+  .content{padding:18px}.topbar{padding:14px 18px}
+}
+</style></head>
+<body>
+
+<!-- ============ LOGIN ============ -->
+<div id="login">
+  <button class="iconbtn login-theme" onclick="toggleTheme()" id="theme1">🌙</button>
+  <div class="login-card">
+    <div class="login-logo">AV</div>
+    <h1>Avaniko AI</h1>
+    <div class="tag">Sign in to your console</div>
+    <div class="field"><label>Email or admin username</label>
+      <input id="l-id" placeholder="you@avaniko.com" autocomplete="username"/></div>
+    <div class="field"><label>Password</label>
+      <input id="l-pw" type="password" placeholder="••••••••" autocomplete="current-password"
+             onkeydown="if(event.key==='Enter')signin()"/></div>
+    <div id="login-err"></div>
+    <button class="btn" style="width:100%;justify-content:center;margin-top:4px" onclick="signin()">Sign in →</button>
+  </div>
+</div>
+
+<!-- ============ APP ============ -->
+<div id="app"><div id="shell">
+  <aside id="side">
+    <div class="brand"><div class="logo">AV</div>Avaniko AI</div>
+    <nav class="nav">
+      <div class="navitem active" data-tab="dashboard" onclick="go('dashboard')">
+        <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>Dashboard</div>
+      <div class="navitem adminonly" data-tab="users" onclick="go('users')">
+        <svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.2"/><path d="M3.5 20a5.5 5.5 0 0 1 11 0"/><path d="M16 5.2a3 3 0 0 1 0 5.6"/><path d="M18 14.5a5 5 0 0 1 3 4.5"/></svg>Users</div>
+      <div class="navitem adminonly" data-tab="keys" onclick="go('keys')">
+        <svg viewBox="0 0 24 24"><circle cx="8" cy="15" r="4"/><path d="M11 13l8-8"/><path d="M16 5l3 3"/><path d="M19 8l2-2"/></svg>API Keys</div>
+      <div class="navitem" data-tab="test" onclick="go('test')">
+        <svg viewBox="0 0 24 24"><polygon points="6 4 20 12 6 20 6 4"/></svg>Test API Key</div>
+    </nav>
+    <div class="side-bottom">
+      <div class="userbox"><div class="avatar" id="avatar">A</div>
+        <div style="min-width:0"><div class="nm" id="ub-name">—</div><div class="rl" id="ub-role">—</div></div></div>
+      <button class="sbtn" onclick="toggleTheme()" id="theme2">🌙 Theme</button>
+      <a class="sbtn" href="/">← Back to Chat</a>
+      <button class="sbtn" onclick="logout()">Log out</button>
+    </div>
+  </aside>
+
+  <div id="main">
+    <div class="topbar">
+      <button class="iconbtn" id="menu-btn" onclick="document.getElementById('side').classList.toggle('open')">☰</button>
+      <div><h2 id="page-title">Dashboard</h2><div class="crumb" id="crumb">Overview of your account</div></div>
+      <span class="sp"></span>
+    </div>
+    <div class="content">
+
+      <!-- 1. DASHBOARD -->
+      <section class="page show" id="page-dashboard">
+        <div class="stats" id="dash-stats"></div>
+        <div class="card">
+          <div class="card-h"><div><h3 id="dash-table-title">Overview</h3><div class="sub" id="dash-table-sub"></div></div></div>
+          <div class="tablewrap" id="dash-tablewrap"><table id="dash-table"></table></div>
+          <div id="dash-cards" style="display:none"></div>
+        </div>
+      </section>
+
+      <!-- 2. USERS -->
+      <section class="page" id="page-users">
+        <div class="card">
+          <div class="card-h"><div><h3>Create user</h3><div class="sub">Only the admin can create accounts.</div></div></div>
+          <div class="grid">
+            <div><label class="lbl">Name</label><input id="u-name" placeholder="Karthick M"/></div>
+            <div><label class="lbl">Email (login id)</label><input id="u-email" placeholder="karthick@avaniko.com"/></div>
+            <div><label class="lbl">Password</label><input id="u-pass" placeholder="min 6 chars"/></div>
+          </div>
+          <div style="margin-top:18px"><button class="btn" onclick="createUser()">+ Create user</button></div>
+        </div>
+        <div class="card">
+          <div class="card-h"><div><h3>All users</h3><div class="sub">Every account and its usage.</div></div>
+            <button class="btn ghost" onclick="loadAll()">↻ Refresh</button></div>
+          <div class="tablewrap"><table id="users-table"></table></div>
+        </div>
+      </section>
+
+      <!-- 3. API KEYS -->
+      <section class="page" id="page-keys">
+        <div class="card">
+          <div class="card-h"><div><h3>Generate API key</h3><div class="sub">Create as many keys as you need — all stay active and work at the same time.</div></div></div>
+          <div class="grid">
+            <div><label class="lbl">User *</label>
+              <select id="k-email"><option value="">— select a user —</option></select></div>
+            <div><label class="lbl">Key name (optional)</label><input id="k-name" placeholder="defaults to user's name"/></div>
+          </div>
+          <div class="grid" style="margin-top:14px">
+            <div><label class="lbl">Requests / min</label><input id="k-rpm" type="number" value="60"/></div>
+            <div><label class="lbl">Requests / day</label><input id="k-daily" type="number" value="5000"/></div>
+          </div>
+          <div style="margin-top:14px"><label class="lbl">Purpose</label>
+            <select id="k-purpose">
+              <option value="chat">General chat / coding — /v1/chat/completions</option>
+              <option value="ocr">OCR — invoice/document → JSON — /v1/extract</option>
+            </select>
+            <div class="sub" style="margin-top:6px">Picks which quickstart snippet is shown below after the key is created.</div>
+          </div>
+          <div class="kc-think" style="margin-top:14px">
+            <div class="tt">📄 OCR / invoice → JSON access <span class="ts">Allows /v1/extract, /v1/files, /v1/ask, /files/ask. Off blocks those with a 403.</span></div>
+            <label class="switch"><input type="checkbox" id="k-ocr" checked/><span class="sl"></span></label>
+          </div>
+          <div class="sub" style="margin-top:8px">Keys never expire — they work until you revoke them.</div>
+          <div style="margin-top:18px"><button class="btn" onclick="createKey()">⚿ Generate key</button></div>
+          <div id="newkey" style="display:none">
+            <div class="keybox"><code id="newkey-val"></code><button class="btn ghost" onclick="copyKey()">Copy</button></div>
+            <div class="warn">⚠ Shown once — stored hashed, cannot be recovered. Give it to the user.</div>
+            <div class="sub" style="margin-top:12px" id="newkey-snippet-label">Quickstart:</div>
+            <pre id="newkey-snippet"></pre>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-h"><div><h3>All API keys</h3><div class="sub">Every key listed here is active and works simultaneously.</div></div>
+            <button class="btn ghost" onclick="loadAll()">↻ Refresh</button></div>
+          <div class="tablewrap"><table id="keys-table"></table></div>
+        </div>
+      </section>
+
+      <!-- 4. TEST -->
+      <section class="page" id="page-test">
+        <div class="card">
+          <div class="card-h"><div><h3>Test an API key</h3><div class="sub">Paste a key and send a real request to confirm it works.</div></div></div>
+          <label class="lbl">API key</label><input id="d-key" placeholder="ak-..."/>
+          <label class="lbl" style="margin-top:14px">Message</label>
+          <textarea id="d-msg" rows="2">Write one line about Avaniko AI.</textarea>
+          <div style="margin-top:16px"><button class="btn" id="d-btn" onclick="runDemo()">▶ Send test request</button></div>
+          <div id="demo-out">The response will appear here…</div>
+        </div>
+        <div class="card">
+          <div class="card-h"><div><h3>Quickstart</h3><div class="sub">Use the key in any app (OpenAI-compatible).</div></div></div>
+          <pre id="qs"></pre>
+        </div>
+      </section>
+
+    </div>
+  </div>
+</div></div>
+
+<div class="toast" id="toast"></div>
+<script>
+const BASE=location.origin;
+let TOKEN=localStorage.getItem('av_session')||'';
+let ROLE =localStorage.getItem('av_role')||'';
+let NAME =localStorage.getItem('av_name')||'';
+
+function applyTheme(){const l=localStorage.getItem('av_theme')==='light';document.body.classList.toggle('light',l);
+  document.querySelectorAll('#theme1,#theme2').forEach(b=>b.textContent=l?'☀️ Theme':'🌙 Theme');
+  const t1=document.getElementById('theme1'); if(t1)t1.textContent=l?'☀️':'🌙';}
+function toggleTheme(){localStorage.setItem('av_theme',localStorage.getItem('av_theme')==='light'?'dark':'light');applyTheme();}
+applyTheme();
+function toast(m){const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2200);}
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function val(id){return document.getElementById(id).value.trim();}
+
+async function signin(){
+  const err=document.getElementById('login-err');
+  const r=await fetch('/auth/signin',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({email:val('l-id'),password:document.getElementById('l-pw').value})});
+  const d=await r.json();
+  if(!r.ok){err.textContent=d.error?.message||'Login failed';return;}
+  TOKEN=d.token;ROLE=d.role;NAME=d.name||d.email||'';
+  localStorage.setItem('av_session',TOKEN);localStorage.setItem('av_role',ROLE);localStorage.setItem('av_name',NAME);
+  enter();
+}
+async function api(method,path,body){
+  const r=await fetch(path,{method,headers:{'Authorization':'Bearer '+TOKEN,'Content-Type':'application/json'},
+    body:body?JSON.stringify(body):undefined});
+  if(r.status===401||r.status===403){logout();throw 0;}
+  return r.json();
+}
+function enter(){
+  document.getElementById('login').style.display='none';
+  document.getElementById('app').style.display='block';
+  const admin=ROLE==='admin';
+  document.querySelectorAll('.adminonly').forEach(e=>e.style.display=admin?'flex':'none');
+  document.getElementById('ub-name').textContent=NAME||(admin?'Administrator':'User');
+  document.getElementById('ub-role').textContent=admin?'Administrator':'User';
+  document.getElementById('avatar').textContent=(NAME||'A').trim()[0].toUpperCase();
+  document.getElementById('qs').textContent=
+`from openai import OpenAI
+client = OpenAI(base_url="${BASE}/v1", api_key="ak-your-key")
+r = client.chat.completions.create(
+    model="avaniko-ai",
+    messages=[{"role":"user","content":"Hello"}])
+print(r.choices[0].message.content)`;
+  go('dashboard');loadAll();
+}
+const META={dashboard:['Dashboard','Overview of your account'],users:['Users','Create and manage accounts'],
+  keys:['API Keys','Generate and manage keys'],test:['Test API Key','Verify a key works live']};
+function go(tab){
+  document.querySelectorAll('.navitem').forEach(n=>n.classList.toggle('active',n.dataset.tab===tab));
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('show'));
+  document.getElementById('page-'+tab).classList.add('show');
+  document.getElementById('page-title').textContent=META[tab][0];
+  document.getElementById('crumb').textContent=META[tab][1];
+  document.getElementById('side').classList.remove('open');
+}
+async function loadAll(){
+  if(ROLE==='admin'){
+    const [u,k]=await Promise.all([api('GET','/admin-api/users'),api('GET','/admin-api/keys')]);
+    const users=u.users,keys=k.keys;
+    document.getElementById('dash-stats').innerHTML=stat([
+      ['Users',users.length],['Active keys',keys.filter(x=>x.active).length],
+      ['Total requests',keys.reduce((a,x)=>a+x.requests,0)],
+      ['Total tokens',(keys.reduce((a,x)=>a+x.tokens_in+x.tokens_out,0)).toLocaleString()]]);
+    document.getElementById('dash-table-title').textContent='Users overview';
+    document.getElementById('dash-table-sub').textContent='All accounts and their usage.';
+    document.getElementById('dash-tablewrap').style.display='block';
+    document.getElementById('dash-cards').style.display='none';
+    document.getElementById('dash-table').innerHTML=usersTable(users,false);
+    document.getElementById('users-table').innerHTML=usersTable(users,true);
+    document.getElementById('keys-table').innerHTML=keysTable(keys);
+    // populate the "generate key" user dropdown — keys can ONLY go to a real user
+    const sel=document.getElementById('k-email'); const cur=sel.value;
+    sel.innerHTML='<option value="">— select a user —</option>'+
+      users.map(x=>`<option value="${esc(x.email)}">${esc(x.name)} (${esc(x.email)})</option>`).join('');
+    sel.value=cur;
+  }else{
+    const d=await api('GET','/me/usage');
+    document.getElementById('dash-stats').innerHTML=stat([
+      ['Active keys',d.active_keys],['Requests',d.requests],
+      ['Tokens in',(d.tokens_in||0).toLocaleString()],['Tokens out',(d.tokens_out||0).toLocaleString()]]);
+    document.getElementById('dash-table-title').textContent='My API keys';
+    document.getElementById('dash-table-sub').textContent='Each key is shown separately below, with its own thinking-mode status (set by the administrator).';
+    document.getElementById('dash-tablewrap').style.display='none';
+    document.getElementById('dash-cards').style.display='block';
+    document.getElementById('dash-cards').innerHTML=keyCards(d.keys||[]);
+  }
+}
+function stat(items){return items.map(([l,v])=>`<div class="stat"><span class="stat-val">${v}</span><span class="stat-lbl">${l}</span></div>`).join('');}
+function usersTable(users,del){
+  const h=`<thead><tr><th>Name</th><th>Email</th><th>Keys</th><th>Requests</th><th>Tokens in/out</th><th>Created</th>${del?'<th></th>':''}</tr></thead>`;
+  if(!users.length)return h+`<tbody><tr><td colspan="7"><div class="empty">No users yet.</div></td></tr></tbody>`;
+  return h+'<tbody>'+users.map(x=>`<tr><td>${esc(x.name)}</td><td>${esc(x.email)}</td><td>${x.active_keys}/${x.keys}</td>
+    <td>${x.requests}</td><td>${x.tokens_in} / ${x.tokens_out}</td><td>${(x.created||'').slice(0,10)}</td>
+    ${del?`<td><button class="btn danger" onclick="delUser('${esc(x.email)}')">Delete</button></td>`:''}</tr>`).join('')+'</tbody>';
+}
+function maskKey(k){return !k?'—':(k.length<=11?k:k.slice(0,7)+'…'+k.slice(-4));}
+function copyText(t){navigator.clipboard.writeText(t||'').then(()=>toast('Copied ✓'));}
+async function setThinking(id,on){
+  const d=await api('POST','/admin-api/keys/'+id+'/thinking',{thinking:on});
+  if(d.id)toast('Thinking '+(on?'ON':'OFF')+' — '+id);else toast(d.error?.message||'Failed');
+  loadAll();
+}
+async function setOcr(id,on){
+  const d=await api('POST','/admin-api/keys/'+id+'/ocr',{ocr_enabled:on});
+  if(d.id)toast('OCR '+(on?'ON':'OFF')+' — '+id);else toast(d.error?.message||'Failed');
+  loadAll();
+}
+// admin-only: every key, with its owner, a copyable key box and thinking/OCR toggles
+function keysTable(keys){
+  const h=`<thead><tr><th>ID</th><th>Name</th><th>Owner</th><th>Key</th><th>Status</th><th>Thinking</th><th>OCR</th><th>Requests</th><th>Tokens in/out</th><th>Last used</th><th></th></tr></thead>`;
+  if(!keys.length)return h+`<tbody><tr><td colspan="11"><div class="empty">No keys yet.</div></td></tr></tbody>`;
+  return h+'<tbody>'+keys.map(x=>`<tr><td><code>${x.id||'—'}</code></td><td>${esc(x.name)}</td>
+    <td>${esc(x.email)||'—'}</td>
+    <td>${x.key?`<code style="cursor:pointer" title="Click to copy full key" onclick="copyText('${esc(x.key)}')">${esc(maskKey(x.key))}</code>`:'<span style="color:var(--muted)">—</span>'}</td>
+    <td><span class="badge ${x.active?'on':'off'}">${x.active?'active':'revoked'}</span></td>
+    <td><label class="switch"><input type="checkbox" ${x.thinking?'checked':''} onchange="setThinking('${x.id}',this.checked)"/><span class="sl"></span></label></td>
+    <td><label class="switch"><input type="checkbox" ${x.ocr_enabled?'checked':''} onchange="setOcr('${x.id}',this.checked)"/><span class="sl"></span></label></td>
+    <td>${x.requests}</td><td>${x.tokens_in} / ${x.tokens_out}</td>
+    <td>${x.last_used?x.last_used.slice(0,16).replace('T',' '):'never'}</td>
+    <td style="display:flex;gap:6px">
+       ${x.active?`<button class="btn danger" onclick="revoke('${x.id}')">Revoke</button>`:''}
+       <button class="btn danger" onclick="delKey('${x.id}')">Delete</button>
+     </td></tr>`).join('')+'</tbody>';
+}
+// non-admin "My API keys" dashboard: one card per key — key box (copy) + read-only thinking status
+function keyCards(keys){
+  if(!keys.length)return `<div class="empty">No keys yet — ask the administrator to generate one for you.</div>`;
+  return keys.map(k=>`
+    <div class="keycard">
+      <div class="keycard-h">
+        <div><span class="kc-name">${esc(k.name)}</span><span class="kc-owner">${esc(k.id||'')}</span></div>
+        <span class="badge ${k.active?'on':'off'}">${k.active?'active':'revoked'}</span>
+      </div>
+      <div class="keybox">
+        ${k.key?`<code>${esc(k.key)}</code><button class="btn ghost" onclick="copyText('${esc(k.key)}')">Copy</button>`
+               :`<code class="nokey">Full key was shown once at creation — contact admin if lost</code>`}
+      </div>
+      <div class="kc-stats">
+        <span>Requests: <b>${k.requests}</b></span>
+        <span>Tokens: <b>${k.tokens_in} in / ${k.tokens_out} out</b></span>
+        <span>Limit: <b>${k.rpm_limit}/min · ${k.daily_limit}/day</b></span>
+        <span>Last used: <b>${k.last_used?k.last_used.slice(0,16).replace('T',' '):'never'}</b></span>
+      </div>
+      <div class="kc-think">
+        <div class="tt">🧠 Thinking mode <span class="ts">${k.thinking?'On — deeper reasoning':'Off — faster replies'} (set by administrator)</span></div>
+        <label class="switch"><input type="checkbox" disabled ${k.thinking?'checked':''}/><span class="sl"></span></label>
+      </div>
+      <div class="kc-think">
+        <div class="tt">📄 OCR / invoice → JSON <span class="ts">${k.ocr_enabled?'Enabled':'Disabled'} (set by administrator)</span></div>
+        <label class="switch"><input type="checkbox" disabled ${k.ocr_enabled?'checked':''}/><span class="sl"></span></label>
+      </div>
+    </div>`).join('');
+}
+async function createUser(){
+  const d=await api('POST','/admin-api/users',{name:val('u-name'),email:val('u-email'),password:val('u-pass')});
+  if(d.created){toast('User created ✓');['u-name','u-email','u-pass'].forEach(i=>document.getElementById(i).value='');loadAll();}
+  else toast(d.error?.message||'Failed');
+}
+async function delUser(email){if(!confirm('Delete '+email+' and revoke their keys?'))return;await api('DELETE','/admin-api/users/'+encodeURIComponent(email));toast('Deleted');loadAll();}
+const PURPOSE_SNIPPETS={
+  chat:(key)=>`from openai import OpenAI
+client = OpenAI(base_url="${BASE}/v1", api_key="${key}")
+r = client.chat.completions.create(
+    model="avaniko-ai",
+    messages=[{"role":"user","content":"Hello"}])
+print(r.choices[0].message.content)`,
+  ocr:(key)=>`# OCR / invoice, receipt, scanned document → structured JSON
+# Uses the dedicated document pipeline (native PDF text + OCR fallback,
+# page-aware — do NOT send files as inline chat images, accuracy is worse).
+curl ${BASE}/v1/extract \\
+  -H "Authorization: Bearer ${key}" \\
+  -F "files=@invoice.pdf" \\
+  -F "question=Extract all information as structured JSON"`,
+};
+async function createKey(){
+  const email=document.getElementById('k-email').value;
+  if(!email){toast('Select a user first — keys must belong to a user');return;}
+  const purpose=document.getElementById('k-purpose').value;
+  const body={name:val('k-name'),email:email,rpm_limit:parseInt(val('k-rpm'))||60,daily_limit:parseInt(val('k-daily'))||5000,
+              ocr_enabled:document.getElementById('k-ocr').checked};
+  const d=await api('POST','/admin-api/keys',body);
+  if(d.api_key){
+    document.getElementById('newkey-val').textContent=d.api_key;
+    document.getElementById('newkey-snippet').textContent=PURPOSE_SNIPPETS[purpose](d.api_key);
+    document.getElementById('newkey').style.display='block';
+    toast('Key created ✓');loadAll();
+  }else toast(d.error?.message||'Failed');
+}
+function copyKey(){navigator.clipboard.writeText(document.getElementById('newkey-val').textContent).then(()=>toast('Copied ✓'));}
+async function revoke(id){if(!confirm('Revoke '+id+'? It stops working but stays listed.'))return;await api('DELETE','/admin-api/keys/'+id);toast('Revoked');loadAll();}
+async function delKey(id){if(!confirm('Permanently DELETE '+id+'? This cannot be undone.'))return;await api('POST','/admin-api/keys/'+id+'/delete');toast('Deleted');loadAll();}
+async function runDemo(){
+  const key=val('d-key'),msg=val('d-msg'),out=document.getElementById('demo-out'),btn=document.getElementById('d-btn');
+  if(!key){out.textContent='Enter an API key first.';return;}
+  btn.disabled=true;out.textContent='Sending…';
+  try{
+    const r=await fetch('/v1/chat/completions',{method:'POST',headers:{'Authorization':'Bearer '+key,'Content-Type':'application/json'},
+      body:JSON.stringify({model:'avaniko-ai',messages:[{role:'user',content:msg}],max_tokens:200})});
+    const d=await r.json();
+    out.textContent=r.ok?(d.choices?.[0]?.message?.content||JSON.stringify(d)):('Error: '+(d.error?.message||r.status));
+    if(r.ok)loadAll();
+  }catch(e){out.textContent='Request failed: '+e;}finally{btn.disabled=false;}
+}
+function logout(){['av_session','av_role','av_name'].forEach(k=>localStorage.removeItem(k));location.reload();}
+if(TOKEN&&ROLE){
+  const probe=ROLE==='admin'?'/admin-api/users':'/me/usage';
+  fetch(probe,{headers:{'Authorization':'Bearer '+TOKEN}}).then(r=>{if(r.ok)enter();else logout();}).catch(()=>{});
+}
+</script></body></html>

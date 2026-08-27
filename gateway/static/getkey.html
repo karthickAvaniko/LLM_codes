@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Avaniko AI — Get API Key</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0f0f11;--surface:#18181b;--border:#27272a;
+  --text:#f4f4f5;--muted:#71717a;--accent:#8b5cf6;
+  --accent-hover:#7c3aed;--green:#22c55e;--red:#ef4444;--amber:#f59e0b;
+}
+html,body{min-height:100%;font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text)}
+
+header{display:flex;align-items:center;gap:10px;padding:14px 20px;
+  border-bottom:1px solid var(--border);background:var(--surface)}
+.logo{width:32px;height:32px;background:linear-gradient(135deg,#8b5cf6,#6d28d9);
+  border-radius:8px;display:flex;align-items:center;justify-content:center;
+  font-weight:900;font-size:.85rem;color:#fff}
+header h1{font-size:1rem;font-weight:700}
+header span{font-size:.78rem;color:var(--muted);margin-left:4px}
+header a{margin-left:auto;color:var(--muted);font-size:.8rem;text-decoration:none;
+  padding:6px 14px;border:1px solid var(--border);border-radius:7px;transition:all .2s}
+header a:hover{border-color:var(--accent);color:var(--accent)}
+
+main{max-width:560px;margin:0 auto;padding:48px 20px}
+.hero{text-align:center;margin-bottom:28px}
+.hero .logo{width:52px;height:52px;font-size:1.2rem;margin:0 auto 16px}
+.hero h2{font-size:1.4rem;font-weight:800}
+.hero p{color:var(--muted);font-size:.88rem;margin-top:8px;line-height:1.6}
+
+.card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:24px}
+label{display:block;font-size:.78rem;color:var(--muted);margin:14px 0 5px}
+label:first-child{margin-top:0}
+input{width:100%;background:var(--bg);border:1px solid var(--border);border-radius:8px;
+  padding:11px 13px;color:var(--text);font-size:.9rem;outline:none;transition:border-color .2s}
+input:focus{border-color:var(--accent)}
+button{width:100%;margin-top:20px;background:var(--accent);border:none;border-radius:9px;
+  color:#fff;padding:12px;font-size:.92rem;font-weight:700;cursor:pointer;transition:background .2s}
+button:hover{background:var(--accent-hover)}
+button:disabled{opacity:.5;cursor:wait}
+#err{color:var(--red);font-size:.8rem;min-height:1.2em;margin-top:10px;text-align:center}
+
+#result{display:none}
+#result .card{border-color:var(--green)}
+.keybox{display:flex;align-items:center;gap:10px;background:var(--bg);
+  border:1px dashed var(--green);border-radius:8px;padding:13px;margin-top:14px}
+.keybox code{flex:1;font-family:'Fira Code',monospace;font-size:.84rem;word-break:break-all;color:var(--green)}
+.keybox button{width:auto;margin:0;padding:8px 14px;font-size:.8rem;font-weight:500;
+  background:transparent;border:1px solid var(--border);color:var(--text)}
+.keybox button:hover{border-color:var(--accent);color:var(--accent)}
+.warn{color:var(--amber);font-size:.78rem;margin-top:12px}
+.limits{display:flex;gap:10px;margin-top:16px;flex-wrap:wrap}
+.limits div{flex:1;min-width:120px;background:var(--bg);border:1px solid var(--border);
+  border-radius:8px;padding:10px;text-align:center}
+.limits b{display:block;font-size:1rem}
+.limits span{font-size:.7rem;color:var(--muted)}
+pre{background:#09090b;border:1px solid var(--border);border-radius:8px;padding:13px;
+  overflow-x:auto;font-size:.74rem;margin-top:16px;line-height:1.5;color:#d4d4d8}
+.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);
+  background:var(--surface);border:1px solid var(--accent);border-radius:8px;
+  padding:10px 18px;font-size:.83rem;opacity:0;transition:opacity .3s;pointer-events:none}
+.toast.show{opacity:1}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">AV</div>
+  <h1>Avaniko AI</h1><span>Get API Key</span>
+  <a href="/">← Chat</a>
+</header>
+
+<main>
+  <div class="hero">
+    <div class="logo">AV</div>
+    <h2>Get your free API key</h2>
+    <p>One key for everything — chat completions, PDF &amp; document
+       understanding, file storage. OpenAI-compatible API.</p>
+  </div>
+
+  <div id="form" class="card">
+    <label>Your name</label>
+    <input id="name" placeholder="Surya" maxlength="60"/>
+    <label>Email</label>
+    <input id="email" type="email" placeholder="you@company.com" maxlength="120"/>
+    <button id="go" onclick="getKey()">Get API Key</button>
+    <div id="err"></div>
+  </div>
+
+  <div id="result">
+    <div class="card">
+      <h2 style="font-size:1rem">✅ Your API key is ready</h2>
+      <div class="keybox">
+        <code id="keyval"></code>
+        <button onclick="copyKey()">Copy</button>
+      </div>
+      <div class="warn">⚠ Copy it now — this key is shown only once and can never be recovered.</div>
+      <div class="limits">
+        <div><b id="l-rpm"></b><span>requests / minute</span></div>
+        <div><b id="l-day"></b><span>requests / day</span></div>
+        <div><b id="l-exp"></b><span>valid until</span></div>
+      </div>
+      <pre id="example"></pre>
+    </div>
+  </div>
+</main>
+
+<div class="toast" id="toast">Key copied to clipboard</div>
+
+<script>
+async function getKey(){
+  const name  = document.getElementById('name').value.trim();
+  const email = document.getElementById('email').value.trim();
+  const err   = document.getElementById('err');
+  const btn   = document.getElementById('go');
+  err.textContent = '';
+  if (!name || !email){ err.textContent = 'Enter your name and email.'; return; }
+  btn.disabled = true; btn.textContent = 'Generating…';
+  try{
+    const res  = await fetch('/signup/key', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({name, email})
+    });
+    const data = await res.json();
+    if (!res.ok){ err.textContent = data.error?.message || 'Failed — try again.'; return; }
+    document.getElementById('keyval').textContent = data.api_key;
+    document.getElementById('l-rpm').textContent  = data.rpm_limit;
+    document.getElementById('l-day').textContent  = data.daily_limit;
+    document.getElementById('l-exp').textContent  = (data.expires||'').slice(0,10);
+    document.getElementById('example').textContent =
+`curl ${location.origin}/v1/chat/completions \\
+  -H "Authorization: Bearer ${data.api_key}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"messages":[{"role":"user","content":"Hello"}]}'`;
+    document.getElementById('form').style.display   = 'none';
+    document.getElementById('result').style.display = 'block';
+  }catch(e){ err.textContent = 'Gateway unreachable — try again.'; }
+  finally{ btn.disabled = false; btn.textContent = 'Get API Key'; }
+}
+function copyKey(){
+  navigator.clipboard.writeText(document.getElementById('keyval').textContent)
+    .then(()=>{ const t=document.getElementById('toast');
+      t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),2200); });
+}
+document.getElementById('email').addEventListener('keydown', e=>{ if(e.key==='Enter') getKey(); });
+</script>
+</body>
+</html>

@@ -1,0 +1,90 @@
+{
+  "invoice_number": "HY11041-1",
+  "date": "5/1/2026",
+  "po_number": "113",
+  "terms": "Upon Receipt",
+  "vendor": {
+    "name": "Allendale Machinery Systems",
+    "address": "18 Park Way, Upper Saddle River, NJ 07458",
+    "phone": "201-327-5215",
+    "email": "tooling@allendalemachinery.com"
+  },
+  "bill_to": {
+    "name": "Hytorc",
+    "address": "333 Route 17 North, Mahwah, NJ 07430"
+  },
+  "ship_to": {
+    "name": "Hytorc",
+    "address": "18 Industrial Ave, Mahwah, NJ 07430"
+  },
+  "line_items": [
+    {
+      "item_number": "30242",
+      "description": "Helical 4 Flute, Square - Variable Pitch (Aplus), End Mill; Dia 5/16; LOC 3/4; OAL 2-1/2; APLUS Coated",
+      "quantity": 5,
+      "unit_price": 44.46,
+      "amount": 222.3
+    },
+    {
+      "item_number": "31242",
+      "description": "Helical 4 Flute, Square - Variable Pitch (Aplus), End Mill; Dia 5/16; Radius .0200\"; LOC 3/4; OAL 2-1/2; APLUS Coated",
+      "quantity": 5,
+      "unit_price": 49.21,
+      "amount": 246.05
+    },
+    {
+      "item_number": "30142",
+      "description": "Helical 4 Flutes, Square - Variable Pitch (Aplus), End Mill; Dia 1/4; LOC 1/2; OAL 2-1/2; APLUS Coated",
+      "quantity": 5,
+      "unit_price": 33.15,
+      "amount": 165.75
+    },
+    {
+      "item_number": "30167",
+      "description": "Helical 4 Flutes, Square - Variable Pitch (Aplus), End Mill; Dia 1/4; LOC 1; OAL 3; APLUS Coated",
+      "quantity": 5,
+      "unit_price": 52.91,
+      "amount": 264.55
+    },
+    {
+      "item_number": "30152",
+      "description": "Helical 4 Flutes, Square - Variable Pitch (Aplus), End Mill; Dia 1/4; LOC 3/4; OAL 2-1/2; APLUS Coated",
+      "quantity": 5,
+      "unit_price": 35.72,
+      "amount": 178.6
+    },
+    {
+      "item_number": "81636",
+      "description": "Helical 4 Flutes, Square - Variable Pitch (Aplus), End Mill; Dia 1/8; LOC 5/8; OAL 2-1/2; APLUS Coated Shipping Ref: HE5502127",
+      "quantity": 5,
+      "unit_price": 23.18,
+      "amount": 115.9
+    },
+    {
+      "item_number": "73062-C3",
+      "description": "Harvey Miniature End Mill Dia 1/16; LOC .186\"; OAL 1-1/2; Shank 1/8; 4 Flutes; C3 Coated",
+      "quantity": 5,
+      "unit_price": 23.92,
+      "amount": 119.6
+    }
+  ],
+  "financial_summary": {
+    "subtotal": 1312.75,
+    "sales_tax": 0.0,
+    "total": 1312.75,
+    "balance_due": 1312.75
+  },
+  "notes": [
+    "**VMI PO 113, Max $5000.",
+    "Shipping Ref: HT5501692",
+    "700202-NJ-MW18-DOM-4040",
+    "Machine Shop Expenses",
+    "Received 050626",
+    "RP 051226",
+    "All tooling and accessories sales are final.",
+    "Any returns require prior approval from the manufacturer and could be subject to restocking fees.",
+    "Any shipping charges incurred are the responsibility of the customer.",
+    "Remit to: Allendale Machinery Systems, P. O. Box 411018 ,Boston, MA 02241-1018",
+    "Credit Card: For credit card payments, a 3.5% processing fee will be added to the total of the invoice"
+  ]
+}

@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Avaniko AI — API Keys</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0f0f11;--surface:#18181b;--border:#27272a;
+  --text:#f4f4f5;--muted:#71717a;--accent:#8b5cf6;
+  --accent-hover:#7c3aed;--green:#22c55e;--red:#ef4444;--amber:#f59e0b;
+}
+html,body{min-height:100%;font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text)}
+
+header{
+  display:flex;align-items:center;gap:10px;
+  padding:14px 20px;border-bottom:1px solid var(--border);background:var(--surface);
+}
+.logo{width:32px;height:32px;background:linear-gradient(135deg,#8b5cf6,#6d28d9);
+  border-radius:8px;display:flex;align-items:center;justify-content:center;
+  font-weight:900;font-size:.85rem;color:#fff}
+header h1{font-size:1rem;font-weight:700}
+header span{font-size:.78rem;color:var(--muted);margin-left:4px}
+header a{margin-left:auto;color:var(--muted);font-size:.8rem;text-decoration:none;
+  padding:6px 14px;border:1px solid var(--border);border-radius:7px;transition:all .2s}
+header a:hover{border-color:var(--accent);color:var(--accent)}
+
+main{max-width:1080px;margin:0 auto;padding:28px 20px;display:flex;flex-direction:column;gap:22px}
+
+.card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:20px}
+.card h2{font-size:.95rem;font-weight:700;margin-bottom:14px}
+.card h2 small{color:var(--muted);font-weight:400;font-size:.78rem;margin-left:8px}
+
+label{display:block;font-size:.78rem;color:var(--muted);margin-bottom:5px}
+input{
+  width:100%;background:var(--bg);border:1px solid var(--border);border-radius:8px;
+  padding:9px 12px;color:var(--text);font-size:.88rem;outline:none;transition:border-color .2s;
+}
+input:focus{border-color:var(--accent)}
+.row{display:flex;gap:12px;flex-wrap:wrap}
+.row > div{flex:1;min-width:140px}
+
+button{
+  background:var(--accent);border:none;border-radius:8px;color:#fff;
+  padding:9px 18px;font-size:.85rem;font-weight:600;cursor:pointer;transition:background .2s;
+}
+button:hover{background:var(--accent-hover)}
+button.ghost{background:transparent;border:1px solid var(--border);color:var(--text);font-weight:400}
+button.ghost:hover{border-color:var(--accent);color:var(--accent)}
+button.danger{background:transparent;border:1px solid var(--border);color:var(--red);font-weight:400;padding:5px 12px;font-size:.78rem}
+button.danger:hover{border-color:var(--red)}
+button.enable{background:transparent;border:1px solid var(--border);color:var(--green);font-weight:400;padding:5px 12px;font-size:.78rem}
+button.enable:hover{border-color:var(--green)}
+
+/* unlock screen */
+#lock{max-width:420px;margin:80px auto;text-align:center}
+#lock .logo{width:48px;height:48px;font-size:1.1rem;margin:0 auto 16px}
+#lock p{color:var(--muted);font-size:.85rem;margin:8px 0 18px}
+#lock input{text-align:center;margin-bottom:12px}
+#lock-err{color:var(--red);font-size:.8rem;min-height:1.2em;margin-bottom:10px}
+
+/* new key reveal */
+#newkey{display:none;border-color:var(--green)}
+#newkey .keybox{
+  display:flex;align-items:center;gap:10px;background:var(--bg);
+  border:1px dashed var(--green);border-radius:8px;padding:12px;margin-top:10px;
+}
+#newkey code{flex:1;font-family:'Fira Code',monospace;font-size:.85rem;word-break:break-all;color:var(--green)}
+#newkey .warn{color:var(--amber);font-size:.78rem;margin-top:10px}
+
+table{width:100%;border-collapse:collapse;font-size:.82rem}
+th{color:var(--muted);font-weight:600;text-align:left;padding:8px 10px;border-bottom:1px solid var(--border)}
+td{padding:10px;border-bottom:1px solid var(--border);vertical-align:middle}
+tr:last-child td{border-bottom:none}
+td code{font-family:'Fira Code',monospace;font-size:.78rem;color:var(--muted)}
+.badge{display:inline-block;padding:2px 9px;border-radius:99px;font-size:.72rem;font-weight:600}
+.badge.on {background:rgba(34,197,94,.12);color:var(--green)}
+.badge.off{background:rgba(239,68,68,.12);color:var(--red)}
+.muted{color:var(--muted)}
+#refresh{float:right}
+#panel{display:none}
+.toast{
+  position:fixed;bottom:24px;left:50%;transform:translateX(-50%);
+  background:var(--surface);border:1px solid var(--accent);border-radius:8px;
+  padding:10px 18px;font-size:.83rem;opacity:0;transition:opacity .3s;pointer-events:none;
+}
+.toast.show{opacity:1}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">AV</div>
+  <h1>Avaniko AI</h1><span>API Key Console</span>
+  <a href="/">← Chat</a>
+</header>
+
+<!-- ── Unlock screen (admin key required) ── -->
+<div id="lock">
+  <div class="logo">AV</div>
+  <h2>Admin access</h2>
+  <p>Enter the master admin key to manage API keys.<br/>User keys cannot open this console.</p>
+  <input id="adminkey" type="password" placeholder="ak-••••••••••••••••" autocomplete="off"/>
+  <div id="lock-err"></div>
+  <button onclick="unlock()">Unlock</button>
+</div>
+
+<!-- ── Panel ── -->
+<main id="panel">
+
+  <div class="card">
+    <h2>Generate API key <small>give this to a customer — works on /v1/*, /chat, /files/*</small></h2>
+    <div class="row">
+      <div><label>Name *</label><input id="k-name" placeholder="customer1"/></div>
+      <div><label>Requests / minute</label><input id="k-rpm" type="number" value="60"/></div>
+      <div><label>Requests / day</label><input id="k-daily" type="number" value="5000"/></div>
+      <div><label>Expires (days, blank = never)</label><input id="k-exp" type="number" placeholder="never"/></div>
+    </div>
+    <div style="margin-top:14px"><button onclick="createKey()">Generate key</button></div>
+  </div>
+
+  <div class="card" id="newkey">
+    <h2>✅ Key created — copy it now</h2>
+    <div class="keybox">
+      <code id="newkey-val"></code>
+      <button class="ghost" onclick="copyKey()">Copy</button>
+    </div>
+    <div class="warn">⚠ This key is stored hashed on the server and can never be shown again.</div>
+  </div>
+
+  <div class="card">
+    <h2>Keys <button id="refresh" class="ghost" onclick="loadKeys()">Refresh</button></h2>
+    <div style="overflow-x:auto">
+    <table>
+      <thead><tr>
+        <th>ID</th><th>Name</th><th>Email</th><th>Status</th><th>Req/min</th><th>Req/day</th>
+        <th>Requests</th><th>Tokens in/out</th><th>Last used</th><th>Expires</th><th></th>
+      </tr></thead>
+      <tbody id="rows"><tr><td colspan="11" class="muted">Loading…</td></tr></tbody>
+    </table>
+    </div>
+  </div>
+
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+let ADMIN = sessionStorage.getItem('avaniko_admin_key') || '';
+
+function toast(msg){
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.classList.add('show');
+  setTimeout(()=>t.classList.remove('show'), 2200);
+}
+
+async function api(method, path, body){
+  const res = await fetch(path, {
+    method,
+    headers: {'Authorization':'Bearer '+ADMIN, 'Content-Type':'application/json'},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (res.status === 401 || res.status === 403){
+    sessionStorage.removeItem('avaniko_admin_key');
+    document.getElementById('panel').style.display='none';
+    document.getElementById('lock').style.display='block';
+    document.getElementById('lock-err').textContent='Session expired or key invalid — unlock again.';
+    throw new Error('unauthorized');
+  }
+  return res.json();
+}
+
+async function unlock(){
+  ADMIN = document.getElementById('adminkey').value.trim();
+  const err = document.getElementById('lock-err');
+  if (!ADMIN){ err.textContent='Enter the admin key.'; return; }
+  try{
+    const res = await fetch('/admin/keys', {headers:{'Authorization':'Bearer '+ADMIN}});
+    if (!res.ok){ err.textContent='Wrong key — admin master key required.'; return; }
+    sessionStorage.setItem('avaniko_admin_key', ADMIN);
+    showPanel(await res.json());
+  }catch(e){ err.textContent='Gateway unreachable.'; }
+}
+
+function showPanel(data){
+  document.getElementById('lock').style.display='none';
+  document.getElementById('panel').style.display='flex';
+  if (data) render(data.keys);
+  else loadKeys();
+}
+
+async function loadKeys(){
+  const data = await api('GET','/admin/keys');
+  render(data.keys);
+}
+
+function render(keys){
+  const tb = document.getElementById('rows');
+  if (!keys.length){ tb.innerHTML = '<tr><td colspan="11" class="muted">No keys yet — generate the first one above.</td></tr>'; return; }
+  tb.innerHTML = keys.map(k => `
+    <tr>
+      <td><code>${k.id||'—'}</code></td>
+      <td>${esc(k.name)}</td>
+      <td class="muted">${k.email ? esc(k.email) : '—'}</td>
+      <td><span class="badge ${k.active?'on':'off'}">${k.active?'active':'revoked'}</span></td>
+      <td>${k.rpm_limit}</td>
+      <td>${k.daily_limit}</td>
+      <td>${k.requests}</td>
+      <td>${k.tokens_in} / ${k.tokens_out}</td>
+      <td class="muted">${k.last_used ? k.last_used.slice(0,16).replace('T',' ') : 'never'}</td>
+      <td class="muted">${k.expires ? k.expires.slice(0,10) : 'never'}</td>
+      <td>${k.active
+            ? `<button class="danger" onclick="revoke('${k.id}','${esc(k.name)}')">Revoke</button>`
+            : `<button class="enable" onclick="enable('${k.id}')">Enable</button>`}</td>
+    </tr>`).join('');
+}
+
+function esc(s){ return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+async function createKey(){
+  const name = document.getElementById('k-name').value.trim();
+  if (!name){ toast('Name is required'); return; }
+  const body = {name,
+    rpm_limit:   parseInt(document.getElementById('k-rpm').value)   || 60,
+    daily_limit: parseInt(document.getElementById('k-daily').value) || 5000};
+  const exp = parseInt(document.getElementById('k-exp').value);
+  if (exp > 0) body.expires_days = exp;
+  const data = await api('POST','/admin/keys', body);
+  if (data.api_key){
+    document.getElementById('newkey-val').textContent = data.api_key;
+    document.getElementById('newkey').style.display = 'block';
+    document.getElementById('k-name').value = '';
+    loadKeys();
+  } else {
+    toast(data.error?.message || 'Failed');
+  }
+}
+
+function copyKey(){
+  navigator.clipboard.writeText(document.getElementById('newkey-val').textContent)
+    .then(()=>toast('Key copied to clipboard'));
+}
+
+async function revoke(id, name){
+  if (!confirm(`Revoke key ${id} (${name})? It stops working immediately.`)) return;
+  await api('DELETE','/admin/keys/'+id);
+  toast('Key revoked'); loadKeys();
+}
+
+async function enable(id){
+  await api('POST','/admin/keys/'+id+'/enable');
+  toast('Key re-enabled'); loadKeys();
+}
+
+document.getElementById('adminkey').addEventListener('keydown', e=>{ if(e.key==='Enter') unlock(); });
+
+// auto-unlock if a valid admin key is already in this browser session
+if (ADMIN){
+  fetch('/admin/keys',{headers:{'Authorization':'Bearer '+ADMIN}})
+    .then(r => r.ok ? r.json().then(showPanel) : sessionStorage.removeItem('avaniko_admin_key'));
+}
+</script>
+</body>
+</html>

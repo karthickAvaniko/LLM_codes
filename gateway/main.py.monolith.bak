@@ -1,0 +1,1749 @@
+import asyncio
+import hashlib
+import io
+import json
+import logging
+import os
+import secrets
+import time
+import uuid
+from collections import defaultdict, deque
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import fitz  # PyMuPDF
+import httpx
+import numpy as np
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from PIL import Image
+
+LOG_DIR = Path("/workspace/logs")
+LOG_DIR.mkdir(exist_ok=True)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("gateway")
+# app log also goes to a rotating file, independent of stdout redirection
+from logging.handlers import RotatingFileHandler
+_fh = RotatingFileHandler(LOG_DIR / "gateway_app.log", maxBytes=50_000_000, backupCount=5)
+_fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+logging.getLogger().addHandler(_fh)
+
+VLLM_URL  = "http://localhost:7777"
+MODEL        = "qwen3.6-35b"   # internal — what vLLM serves
+PUBLIC_MODEL = "avaniko-ai"    # white-label name customers see everywhere
+STATIC    = Path(__file__).parent / "static"
+
+# ── Persistent JSONL logs (survive restarts — /workspace is the persistent volume) ──
+ACCESS_LOG  = LOG_DIR / "access.jsonl"    # every HTTP request, incl. 401s
+CONTENT_LOG = LOG_DIR / "requests.jsonl"  # full questions/answers/OCR details
+
+LOG_MAX_BYTES   = 200_000_000  # rotate at 200 MB, keep one previous generation
+LOG_STR_LIMIT   = 1000         # store previews of customer content, not full text
+
+def _trunc(value):
+    if isinstance(value, str) and len(value) > LOG_STR_LIMIT:
+        return value[:LOG_STR_LIMIT] + f"…[truncated {len(value)} chars]"
+    if isinstance(value, list):
+        return [_trunc(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _trunc(v) for k, v in value.items()}
+    return value
+
+def _append_jsonl(path: Path, record: dict):
+    record["ts"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    try:
+        if path.exists() and path.stat().st_size > LOG_MAX_BYTES:
+            path.replace(path.with_suffix(path.suffix + ".1"))
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(_trunc(record), ensure_ascii=False) + "\n")
+    except Exception as e:
+        log.error(f"LOGWRITE failed | {path.name} | {e}")
+
+def _client_ip(request: Request) -> str:
+    return request.headers.get("x-forwarded-for", "").split(",")[0].strip() \
+        or (request.client.host if request.client else "?")
+
+# ── API key ───────────────────────────────────────────────
+# Priority: env AVANIKO_API_KEY > .api_key file > generate new
+_KEY_FILE = Path(__file__).parent / ".api_key"
+
+def _load_api_key() -> str:
+    key = os.environ.get("AVANIKO_API_KEY", "").strip()
+    if key:
+        return key
+    if _KEY_FILE.exists():
+        key = _KEY_FILE.read_text().strip()
+        if key:
+            return key
+    key = "ak-" + secrets.token_hex(24)
+    _KEY_FILE.write_text(key)
+    _KEY_FILE.chmod(0o600)
+    log.info("API KEY generated and saved to %s", _KEY_FILE)
+    return key
+
+API_KEY = _load_api_key()  # admin / master key
+
+# ── User API keys (production, MySQL-backed) ─────────────
+# MySQL stores SHA-256 hashes only — raw keys are shown once at creation
+# and cannot be recovered from the server afterwards. The gateway keeps an
+# in-memory cache for fast per-request auth; usage flushes to MySQL every 15s.
+KEYS_FILE = Path(__file__).parent / "keys.json"  # legacy — migrated to MySQL
+
+import pymysql
+
+def _mysql_password() -> str:
+    env = Path(__file__).parent / ".mysql_env"
+    for line in env.read_text().splitlines():
+        if line.startswith("MYSQL_PASSWORD="):
+            return line.split("=", 1)[1].strip()
+    raise RuntimeError("MYSQL_PASSWORD missing in gateway/.mysql_env")
+
+MYSQL_PASSWORD = _mysql_password()
+
+def _db():
+    return pymysql.connect(host="127.0.0.1", user="avaniko",
+                           password=MYSQL_PASSWORD, database="avaniko",
+                           autocommit=True, cursorclass=pymysql.cursors.DictCursor)
+
+_KEY_COLS = ("id", "name", "email", "created", "active", "expires", "rpm_limit",
+             "daily_limit", "requests", "tokens_in", "tokens_out", "last_used",
+             "self_service")
+
+DEFAULT_RPM_LIMIT   = 60      # requests per minute per key
+DEFAULT_DAILY_LIMIT = 5000    # requests per UTC day per key
+MAX_TOKENS_CAP      = 8192    # hard cap on max_tokens per request
+
+def _now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+def _hash_key(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+def _row_to_info(row: dict) -> dict:
+    info = {k: row[k] for k in _KEY_COLS}
+    info["active"]       = bool(info["active"])
+    info["self_service"] = bool(info.get("self_service"))
+    return info
+
+def _load_keys() -> dict:
+    """Load all keys from MySQL; one-time migrate legacy keys.json if present."""
+    with _db() as conn, conn.cursor() as cur:
+        cur.execute("SELECT * FROM api_keys")
+        keys = {row["key_hash"]: _row_to_info(row) for row in cur.fetchall()}
+
+    if not keys and KEYS_FILE.exists():  # migrate legacy JSON store
+        try:
+            data = json.loads(KEYS_FILE.read_text())
+            legacy = data.get("keys", data) if isinstance(data, dict) else {}
+            for h, info in legacy.items():
+                if not isinstance(info, dict):
+                    continue
+                keys[h] = {c: info.get(c) for c in _KEY_COLS}
+                keys[h].setdefault("rpm_limit", DEFAULT_RPM_LIMIT)
+                keys[h]["active"] = bool(info.get("active"))
+                keys[h]["self_service"] = bool(info.get("self_service"))
+            if keys:
+                _persist_keys(keys)
+                KEYS_FILE.rename(KEYS_FILE.with_suffix(".json.migrated"))
+                log.info("keys.json migrated to MySQL (%d keys)", len(keys))
+        except Exception as e:
+            log.error(f"keys.json migration failed: {e}")
+    return keys
+
+def _persist_keys(keys: dict):
+    cols = ", ".join(("key_hash",) + _KEY_COLS)
+    ph   = ", ".join(["%s"] * (len(_KEY_COLS) + 1))
+    upd  = ", ".join(f"{c}=VALUES({c})" for c in _KEY_COLS)
+    sql  = f"INSERT INTO api_keys ({cols}) VALUES ({ph}) ON DUPLICATE KEY UPDATE {upd}"
+    rows = [(h, *[info.get(c) for c in _KEY_COLS]) for h, info in keys.items()]
+    with _db() as conn, conn.cursor() as cur:
+        cur.executemany(sql, rows)
+
+API_KEYS = _load_keys()       # {sha256_hash: {metadata}} — in-memory cache
+_keys_dirty = False           # usage counters pending flush to MySQL
+
+def _save_keys():
+    """Flush the in-memory cache to MySQL (upsert; table is small)."""
+    global _keys_dirty
+    try:
+        if API_KEYS:
+            _persist_keys(API_KEYS)
+        _keys_dirty = False
+    except Exception as e:
+        log.error(f"MySQL persist failed (in-memory cache still serving): {e}")
+
+# ── Rate limiting (in-memory, per key hash) ───────────────
+_rpm_windows  = defaultdict(deque)   # key_hash -> timestamps of last minute
+_daily_counts = {}                   # key_hash -> [utc_date_str, count]
+_auth_fails   = defaultdict(deque)   # ip -> timestamps of failed auths
+AUTH_FAIL_LIMIT = 20                 # failed attempts per minute per IP
+
+def _prune(window: deque, horizon: float):
+    while window and window[0] < horizon:
+        window.popleft()
+
+def _check_rate_limit(key_hash: str, info: dict) -> str | None:
+    """Return an error message if over limit, else None (and record the hit)."""
+    now = time.time()
+    win = _rpm_windows[key_hash]
+    _prune(win, now - 60)
+    if len(win) >= info.get("rpm_limit", DEFAULT_RPM_LIMIT):
+        return f"Rate limit exceeded: {info.get('rpm_limit', DEFAULT_RPM_LIMIT)} requests/minute. Retry shortly."
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    day = _daily_counts.get(key_hash)
+    if day is None or day[0] != today:
+        day = _daily_counts[key_hash] = [today, 0]
+    if day[1] >= info.get("daily_limit", DEFAULT_DAILY_LIMIT):
+        return f"Daily quota exceeded: {info.get('daily_limit', DEFAULT_DAILY_LIMIT)} requests/day. Resets at midnight UTC."
+    win.append(now)
+    day[1] += 1
+    return None
+
+def _auth_fail_blocked(ip: str) -> bool:
+    now = time.time()
+    win = _auth_fails[ip]
+    _prune(win, now - 60)
+    win.append(now)
+    return len(win) > AUTH_FAIL_LIMIT
+
+def _resolve_key(token: str) -> tuple[str, str | None, str | None]:
+    """Validate token. Returns (user_name|'', key_hash|None, error_message|None)."""
+    global _keys_dirty
+    if secrets.compare_digest(token, API_KEY):
+        return "admin", None, None
+    key_hash = _hash_key(token)
+    info = API_KEYS.get(key_hash)
+    if not info or not info.get("active"):
+        return "", None, "Invalid or missing API key. Send header: Authorization: Bearer <key>"
+    if info.get("expires") and info["expires"] < _now_iso():
+        return "", None, "API key expired. Contact support for a new key."
+    limit_err = _check_rate_limit(key_hash, info)
+    if limit_err:
+        return info.get("name", "user"), key_hash, limit_err
+    info["requests"] = info.get("requests", 0) + 1
+    info["last_used"] = _now_iso()
+    _keys_dirty = True
+    return info.get("name", "user"), key_hash, None
+
+def _record_tokens(key_hash: str | None, usage: dict | None):
+    """Accumulate token usage from a vLLM response onto the key."""
+    global _keys_dirty
+    if not key_hash or not usage:
+        return
+    info = API_KEYS.get(key_hash)
+    if info:
+        info["tokens_in"]  = info.get("tokens_in", 0)  + (usage.get("prompt_tokens") or 0)
+        info["tokens_out"] = info.get("tokens_out", 0) + (usage.get("completion_tokens") or 0)
+        _keys_dirty = True
+
+async def _persist_loop():
+    """Flush dirty usage counters every 15s; prune rate-limit memory hourly."""
+    tick = 0
+    while True:
+        await asyncio.sleep(15)
+        tick += 1
+        if _keys_dirty:
+            try:
+                _save_keys()
+            except Exception as e:
+                log.error(f"keys.json persist failed: {e}")
+        if tick % 240 == 0:  # hourly: drop idle entries so memory never grows
+            horizon = time.time() - 3600
+            for d in (_rpm_windows, _auth_fails, _signups_by_ip):
+                for k in [k for k, w in d.items() if not w or w[-1] < horizon]:
+                    del d[k]
+
+# Paths reachable without a key (UI shells + health probe).
+# /keys is only the HTML shell — every action it performs calls /admin/*,
+# which the middleware locks to the master admin key.
+# /getkey + /signup/key are the public self-service key signup
+# (protected by per-IP and per-email limits, trial quotas, 30-day expiry).
+PUBLIC_PATHS = {"/", "/health", "/favicon.ico", "/keys", "/getkey", "/signup/key",
+                "/console", "/auth/register", "/auth/login"}
+
+app = FastAPI(title="Avaniko AI Gateway")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+)
+
+@app.middleware("http")
+async def require_api_key(request: Request, call_next):
+    start = time.time()
+    ip    = _client_ip(request)
+
+    if request.method == "OPTIONS" or request.url.path in PUBLIC_PATHS:
+        response = await call_next(request)
+        _append_jsonl(ACCESS_LOG, {"ip": ip, "method": request.method,
+                                   "path": request.url.path, "status": response.status_code,
+                                   "ms": int((time.time() - start) * 1000), "auth": "public"})
+        return response
+
+    auth = request.headers.get("authorization", "")
+    token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+
+    # console session paths (user accounts) — session token, not API key
+    if request.url.path.startswith("/me") or request.url.path == "/auth/logout":
+        email = _session_email(token) if token else None
+        if not email:
+            _append_jsonl(ACCESS_LOG, {"ip": ip, "method": request.method,
+                                       "path": request.url.path, "status": 401,
+                                       "ms": int((time.time() - start) * 1000), "auth": "SESSION-REJECTED"})
+            if _auth_fail_blocked(ip):
+                return JSONResponse(status_code=429, headers={"Retry-After": "60"},
+                                    content={"error": {"message": "Too many failed attempts."}})
+            return JSONResponse(status_code=401, content={"error": {
+                "message": "Not signed in. Log in at /console."}})
+        request.state.user_email = email
+        request.state.session_token = token
+        response = await call_next(request)
+        _append_jsonl(ACCESS_LOG, {"ip": ip, "method": request.method,
+                                   "path": request.url.path, "status": response.status_code,
+                                   "ms": int((time.time() - start) * 1000), "auth": f"user:{email}"})
+        return response
+
+    user, key_hash, err = _resolve_key(token) if token else ("", None, "Invalid or missing API key. Send header: Authorization: Bearer <key>")
+
+    if err and not user:  # bad/expired key → 401 (with per-IP brute-force lockout)
+        _append_jsonl(ACCESS_LOG, {"ip": ip, "method": request.method,
+                                   "path": request.url.path, "status": 401,
+                                   "ms": int((time.time() - start) * 1000), "auth": "REJECTED"})
+        if _auth_fail_blocked(ip):
+            return JSONResponse(
+                status_code=429,
+                headers={"Retry-After": "60"},
+                content={"error": {"message": "Too many failed authentication attempts. Try again in a minute.", "type": "rate_limit_error"}},
+            )
+        return JSONResponse(
+            status_code=401,
+            content={"error": {"message": err, "type": "authentication_error"}},
+        )
+
+    if err:  # valid key but over its rate limit / daily quota → 429
+        _append_jsonl(ACCESS_LOG, {"ip": ip, "method": request.method,
+                                   "path": request.url.path, "status": 429,
+                                   "ms": int((time.time() - start) * 1000), "auth": user})
+        return JSONResponse(
+            status_code=429,
+            headers={"Retry-After": "60"},
+            content={"error": {"message": err, "type": "rate_limit_error"}},
+        )
+
+    request.state.user = user
+    request.state.key_hash = key_hash
+
+    # admin endpoints need the master key, not a user key
+    if request.url.path.startswith("/admin") and user != "admin":
+        _append_jsonl(ACCESS_LOG, {"ip": ip, "method": request.method,
+                                   "path": request.url.path, "status": 403,
+                                   "ms": int((time.time() - start) * 1000), "auth": user})
+        return JSONResponse(status_code=403,
+                            content={"error": {"message": "Admin key required", "type": "permission_error"}})
+
+    try:
+        response = await call_next(request)
+    except ContextOverflow:
+        response = JSONResponse(status_code=422, content={"error": {
+            "message": "Document text too dense for the model context even after chunking. "
+                       "Try a smaller file or ask about specific pages.",
+            "type": "invalid_request_error"}})
+    except Exception:
+        log.exception(f"UNHANDLED 500 | {request.method} {request.url.path}")
+        response = JSONResponse(status_code=500, content={"error": {
+            "message": "Internal server error — details are in the server logs.",
+            "type": "server_error"}})
+    _append_jsonl(ACCESS_LOG, {"ip": ip, "method": request.method,
+                               "path": request.url.path, "status": response.status_code,
+                               "ms": int((time.time() - start) * 1000), "auth": user})
+    return response
+
+# ── OCR via isolated microservice (127.0.0.1:7780) ───────
+# PaddleOCR runs in its OWN process with auto-restart. A Paddle crash never
+# touches the gateway; a hang is bounded by the request timeout.
+OCR_URL = "http://127.0.0.1:7780"
+
+def ocr_image(img_bytes: bytes, label: str = "") -> str:
+    """Blocking call to the OCR service. Returns "" on any failure so the
+    document pipeline degrades gracefully instead of erroring."""
+    try:
+        r = httpx.post(f"{OCR_URL}/ocr", content=img_bytes, timeout=120)
+        if r.status_code == 200:
+            text = r.json().get("text", "")
+            log.info(f"OCR | {label} | {len(text)} chars")
+            return text
+        log.error(f"OCR service {r.status_code} | {label}")
+    except Exception as e:
+        log.error(f"OCR service unreachable | {label} | {e}")
+    return ""
+
+def extract_pages(content: bytes, filename: str) -> list[str]:
+    """Extract text page-by-page. Pages with no embedded text get OCR'd
+    individually, so mixed digital/scanned PDFs work."""
+    ext = filename.lower().rsplit(".", 1)[-1]
+
+    if ext in ("png", "jpg", "jpeg", "webp", "bmp", "tiff"):
+        return [ocr_image(content, filename)]
+
+    if ext == "pdf":
+        doc   = fitz.open(stream=content, filetype="pdf")
+        pages = []
+        for i, page in enumerate(doc):
+            text = page.get_text()
+            if len(text.strip()) < 50:  # scanned / image page → OCR it
+                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                buf = io.BytesIO()
+                Image.frombytes("RGB", [pix.width, pix.height], pix.samples).save(buf, "PNG")
+                text = ocr_image(buf.getvalue(), f"{filename} p{i+1}")
+            pages.append(text)
+        doc.close()
+        return pages
+
+    if ext == "docx":
+        try:
+            from docx import Document
+            d = Document(io.BytesIO(content))
+            parts = [p.text for p in d.paragraphs if p.text.strip()]
+            for t in d.tables:
+                for row in t.rows:
+                    parts.append(" | ".join(c.text.strip() for c in row.cells))
+            text = "\n".join(parts)
+            return [text[i:i + 10_000] for i in range(0, len(text), 10_000)] or [""]
+        except Exception as e:
+            log.error(f"DOCX parse failed | {filename} | {e}")
+            return [""]
+
+    if ext in ("xlsx", "xls"):
+        try:
+            import pandas as pd
+            sheets = pd.read_excel(io.BytesIO(content), sheet_name=None)
+            return [f"[Sheet: {name}]\n{df.to_csv(index=False)}"
+                    for name, df in sheets.items()] or [""]
+        except Exception as e:
+            log.error(f"XLSX parse failed | {filename} | {e}")
+            return [""]
+
+    # plain text / csv / etc. — split into ~10k-char pseudo-pages so the
+    # chunker can break huge files on page boundaries
+    try:
+        text = content.decode("utf-8", errors="ignore")
+        return [text[i:i + 10_000] for i in range(0, len(text), 10_000)] or [""]
+    except Exception:
+        return [""]
+
+def extract_text(content: bytes, filename: str) -> str:
+    return "\n\n".join(extract_pages(content, filename))
+
+def _warm_ocr():
+    """OCR now lives in its own service (ocr_server.py) — nothing to warm here."""
+    pass
+
+# ── Document Q&A engine ───────────────────────────────────
+# Model context is 32k tokens. Strategy chosen automatically by size:
+#   ≤ SINGLE_SHOT_CHARS → one call with the full document
+#   larger              → map-reduce: question per chunk, then combine
+SINGLE_SHOT_CHARS = 60_000   # ~17k tokens of document → fits with room for the answer
+CHUNK_CHARS       = 35_000   # map chunk size — safe even for token-dense OCR text
+                             # (numbers/tables tokenize at ~1.7 chars/token)
+
+class ContextOverflow(Exception):
+    """vLLM rejected the request: prompt too long for the 32k context."""
+MAP_CONCURRENCY   = 4        # parallel chunk calls — vLLM batches them on the GPU
+
+DOC_SYSTEM = ("You are a helpful document assistant. Answer the user's request "
+              "using the document content provided, and be accurate. "
+              "IMPORTANT: reply in the format the user asks for — if they ask you "
+              "to analyse, explain, summarize, or answer a question, reply in clear "
+              "plain language (prose), NOT JSON. Only output JSON when the user "
+              "explicitly asks for JSON or structured data extraction.")
+
+async def _llm(messages: list, key_hash: str | None, max_tokens: int = 4096) -> str:
+    body = {"model": MODEL, "messages": messages, "max_tokens": max_tokens,
+            "chat_template_kwargs": {"enable_thinking": False}}
+    async with httpx.AsyncClient(timeout=300) as c:
+        r = await c.post(f"{VLLM_URL}/v1/chat/completions", json=body)
+        data = r.json()
+        if r.status_code != 200 or "choices" not in data:
+            detail = json.dumps(data)[:300]
+            if "maximum context length" in detail:
+                raise ContextOverflow(detail)
+            raise HTTPException(status_code=502, detail=f"Model backend error: {detail}")
+        _record_tokens(key_hash, data.get("usage"))
+        return data["choices"][0]["message"].get("content", "")
+
+def _pages_text(pages: list[str], first_page: int = 1) -> str:
+    return "\n\n".join(f"[Page {first_page + i}]\n{p}" for i, p in enumerate(pages))
+
+def _chunk_pages(pages: list[str]) -> list[tuple[int, int, str]]:
+    """Group pages into chunks of ≤ CHUNK_CHARS. Returns (start, end, text)."""
+    chunks, cur, cur_start, cur_len = [], [], 1, 0
+    for i, ptext in enumerate(pages, 1):
+        if cur and cur_len + len(ptext) > CHUNK_CHARS:
+            chunks.append((cur_start, i - 1, _pages_text(cur, cur_start)))
+            cur, cur_start, cur_len = [], i, 0
+        cur.append(ptext)
+        cur_len += len(ptext)
+    if cur:
+        chunks.append((cur_start, len(pages), _pages_text(cur, cur_start)))
+    return chunks
+
+def _doc_messages(fname: str, doc_text: str, question: str, part: str = "") -> list:
+    intro = f"Document: {fname}" + (f" ({part})" if part else "")
+    return [
+        {"role": "system", "content": DOC_SYSTEM},
+        {"role": "user", "content": f"{intro}\n\n{doc_text}\n\nTask: {question}"},
+    ]
+
+async def _map_chunks(fname: str, chunks: list, question: str, key_hash: str | None) -> list[str]:
+    """Ask the question against every chunk in parallel (bounded)."""
+    sem = asyncio.Semaphore(MAP_CONCURRENCY)
+    map_task = (f"{question}\n\nIMPORTANT: You only see pages of a larger document. "
+                f"Report ONLY what is explicitly written in these pages, citing the page number. "
+                f"If something asked for is not in these pages, write 'NOT FOUND in these pages' "
+                f"for that item — never guess or infer it.")
+    async def one(a: int, b: int, text: str) -> str:
+        async with sem:
+            part = await _llm(_doc_messages(fname, text, map_task, f"pages {a}-{b} of a larger document"),
+                              key_hash)
+            return f"--- Findings from pages {a}-{b} ---\n{part}"
+    return list(await asyncio.gather(*[one(a, b, t) for a, b, t in chunks]))
+
+def _reduce_messages(fname: str, partials: list[str], question: str) -> list:
+    joined = "\n\n".join(partials)
+    return [
+        {"role": "system", "content": DOC_SYSTEM},
+        {"role": "user", "content":
+            f"Document: {fname} — it was analyzed in {len(partials)} parts. "
+            f"Below are the findings from each part.\n\n{joined}\n\n"
+            f"Task: Combine all findings into one complete, final answer "
+            f"(merge duplicates, keep page references where useful). "
+            f"Ignore any 'NOT FOUND in these pages' entries when another part "
+            f"found the answer; prefer findings with explicit page citations. "
+            f"Original task: {question}"},
+    ]
+
+async def answer_document(fname: str, pages: list[str], question: str,
+                          key_hash: str | None) -> tuple[str, str, int]:
+    """Returns (answer, strategy, llm_calls)."""
+    total = sum(len(p) for p in pages)
+    if total <= SINGLE_SHOT_CHARS:
+        try:
+            answer = await _llm(_doc_messages(fname, _pages_text(pages), question),
+                                key_hash, max_tokens=8192)
+            return answer, "single_pass", 1
+        except ContextOverflow:
+            log.info(f"DOC | {fname} | token-dense text overflowed single pass — using map_reduce")
+    chunks   = _chunk_pages(pages)
+    partials = await _map_chunks(fname, chunks, question, key_hash)
+    calls    = len(chunks)
+
+    # Hierarchical reduce: a 500+ page doc produces more partial findings than
+    # one combine call can hold — merge in groups of 5 until they fit.
+    sem = asyncio.Semaphore(MAP_CONCURRENCY)
+    async def _reduce_group(group: list[str]) -> str:
+        async with sem:
+            return await _llm(_reduce_messages(fname, group, question),
+                              key_hash, max_tokens=2048)
+    while sum(len(p) for p in partials) > 30_000 and len(partials) > 3:
+        groups   = [partials[i:i + 5] for i in range(0, len(partials), 5)]
+        merged   = await asyncio.gather(*[_reduce_group(g) for g in groups])
+        calls   += len(groups)
+        partials = [f"--- Combined findings part {i + 1} ---\n{m}"
+                    for i, m in enumerate(merged)]
+
+    answer = await _llm(_reduce_messages(fname, partials, question),
+                        key_hash, max_tokens=8192)
+    return answer, "map_reduce", calls + 1
+
+async def _llm_sse(messages: list, key_hash: str | None, max_tokens: int = 8192):
+    """Stream a vLLM completion as OpenAI-style SSE chunks (Claude-like live tokens)."""
+    body = {"model": MODEL, "messages": messages, "stream": True,
+            "max_tokens": max_tokens,
+            "stream_options": {"include_usage": True},
+            "chat_template_kwargs": {"enable_thinking": False}}
+    usage = None
+    async with httpx.AsyncClient(timeout=300) as c:
+        async with c.stream("POST", f"{VLLM_URL}/v1/chat/completions", json=body) as r:
+            async for line in r.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                raw = line[5:].strip()
+                if raw == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(raw)
+                    usage = obj.get("usage") or usage
+                except Exception:
+                    continue
+                yield raw
+    _record_tokens(key_hash, usage)
+
+# ── RAG index (per-file chunk embeddings via local embed service) ──
+EMBED_URL     = "http://127.0.0.1:7779"
+RAG_TOP_K     = 5      # chunks sent to the LLM — prompt size stays constant
+RAG_CANDIDATES = 20    # retrieved before final cut (reranker slot later)
+_VEC_CACHE: dict = {}  # fid -> (vectors, chunks)
+
+async def _embed(texts: list[str]) -> np.ndarray:
+    async with httpx.AsyncClient(timeout=120) as c:
+        r = await c.post(f"{EMBED_URL}/embed", json={"texts": texts})
+        r.raise_for_status()
+        return np.array(r.json()["vectors"], dtype=np.float32)
+
+def _rag_chunks(pages: list[str]) -> list[dict]:
+    """Page-level chunks; big pages split to ~1800 chars with overlap."""
+    chunks = []
+    for i, p in enumerate(pages, 1):
+        t = p.strip()
+        if not t:
+            continue
+        if len(t) <= 1800:
+            chunks.append({"page": i, "text": t})
+        else:
+            for j in range(0, len(t), 1500):
+                chunks.append({"page": i, "text": t[j:j + 1800]})
+    return chunks
+
+async def _ensure_index(fid: str):
+    """Build (or load) the vector index for a ready file. Returns (vecs, chunks) or None."""
+    if fid in _VEC_CACHE:
+        return _VEC_CACHE[fid]
+    vp = FILES_DIR / f"{fid}.vec.npy"
+    cp = FILES_DIR / f"{fid}.rag.json"
+    if vp.exists() and cp.exists():
+        vecs, chunks = np.load(vp), json.loads(cp.read_text())
+    else:
+        pages  = json.loads(_pages_path(fid).read_text())
+        chunks = _rag_chunks(pages)
+        if not chunks:
+            return None
+        vecs = await _embed([c["text"] for c in chunks])
+        np.save(vp, vecs)
+        cp.write_text(json.dumps(chunks, ensure_ascii=False))
+        log.info(f"RAG indexed | {fid} | {len(chunks)} chunks")
+    _VEC_CACHE[fid] = (vecs, chunks)
+    return _VEC_CACHE[fid]
+
+async def rag_retrieve(metas: list[dict], question: str, top_k: int = RAG_TOP_K) -> list[dict]:
+    """Search across many files; return best chunks with file/page sources."""
+    qvec = (await _embed([question]))[0]
+    scored = []
+    for meta in metas:
+        try:
+            idx = await _ensure_index(meta["id"])
+        except Exception as e:
+            log.error(f"RAG index failed | {meta['id']} | {e}")
+            continue
+        if not idx:
+            continue
+        vecs, chunks = idx
+        sims = vecs @ qvec  # normalized vectors → cosine similarity
+        for ci in np.argsort(sims)[::-1][:RAG_CANDIDATES]:
+            scored.append({"score": float(sims[ci]),
+                           "file_id": meta["id"], "filename": meta["filename"],
+                           "page": chunks[ci]["page"], "text": chunks[ci]["text"]})
+    scored.sort(key=lambda s: s["score"], reverse=True)
+    return scored[:top_k]
+
+def _rag_messages(hits: list[dict], question: str) -> list:
+    ctx = "\n\n".join(f"[{h['filename']} — page {h['page']}]\n{h['text']}" for h in hits)
+    return [
+        {"role": "system", "content": DOC_SYSTEM},
+        {"role": "user", "content":
+            f"Context from the user's documents:\n\n{ctx}\n\n"
+            f"Answer the question using ONLY the context above. "
+            f"Cite the file name and page for each fact. "
+            f"If the context does not contain the answer, say so.\n\n"
+            f"Question: {question}"},
+    ]
+
+# ── Routes ────────────────────────────────────────────────
+
+@app.on_event("startup")
+async def startup():
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(None, _warm_ocr)
+    asyncio.create_task(_persist_loop())
+    # files caught mid-extraction by a restart would stay "processing" forever
+    for meta in _owner_metas("admin"):
+        if meta.get("status") == "processing":
+            meta.update(status="error", error="Extraction interrupted by server restart — please re-upload.")
+            _save_meta(meta)
+            log.warning(f"FILE recovered from stuck state | {meta['id']}")
+    log.info("Gateway started — vLLM: %s", VLLM_URL)
+
+@app.on_event("shutdown")
+async def shutdown():
+    if _keys_dirty:
+        _save_keys()
+
+@app.get("/")
+async def index():
+    return FileResponse(STATIC / "index.html")
+
+@app.get("/keys")
+async def keys_console():
+    return FileResponse(STATIC / "admin.html")
+
+# ── Developer console: register / login / my keys ─────────
+@app.get("/console")
+async def console_page():
+    return FileResponse(STATIC / "console.html")
+
+@app.post("/auth/register")
+async def auth_register(request: Request, payload: dict):
+    email = (payload.get("email") or "").strip().lower()
+    name  = (payload.get("name") or "").strip()[:60]
+    pw    = payload.get("password") or ""
+    if not ALLOWED_EMAIL_RE.match(email):
+        return JSONResponse(status_code=403, content={"error": {
+            "message": "Registration is restricted to @avaniko.com email addresses."}})
+    if not name or len(pw) < 8:
+        return JSONResponse(status_code=400, content={"error": {
+            "message": "Provide your name and a password of at least 8 characters."}})
+    if _user_get(email):
+        return JSONResponse(status_code=409, content={"error": {
+            "message": "Account already exists — log in instead."}})
+    with _db() as conn, conn.cursor() as cur:
+        cur.execute("INSERT INTO users (email, name, pw_hash, created) VALUES (%s,%s,%s,%s)",
+                    (email, name, _pw_hash(pw), _now_iso()))
+    log.info(f"USER registered | {name} <{email}> | ip {_client_ip(request)}")
+    return {"token": _session_create(email), "email": email, "name": name}
+
+@app.post("/auth/login")
+async def auth_login(request: Request, payload: dict):
+    email = (payload.get("email") or "").strip().lower()
+    pw    = payload.get("password") or ""
+    u = _user_get(email)
+    if not u or not u["active"] or not _pw_verify(pw, u["pw_hash"]):
+        if _auth_fail_blocked(_client_ip(request)):
+            return JSONResponse(status_code=429, headers={"Retry-After": "60"},
+                                content={"error": {"message": "Too many attempts. Wait a minute."}})
+        return JSONResponse(status_code=401, content={"error": {
+            "message": "Wrong email or password."}})
+    log.info(f"USER login | {email} | ip {_client_ip(request)}")
+    return {"token": _session_create(email), "email": email, "name": u["name"]}
+
+@app.post("/auth/logout")
+async def auth_logout(request: Request):
+    _session_destroy(getattr(request.state, "session_token", ""))
+    return {"ok": True}
+
+def _my_keys(email: str) -> list[dict]:
+    return [dict(_key_summary(v)) for v in API_KEYS.values() if v.get("email") == email]
+
+@app.get("/me/keys")
+async def me_keys(request: Request):
+    email = request.state.user_email
+    u = _user_get(email)
+    return {"email": email, "name": u["name"] if u else "",
+            "keys": sorted(_my_keys(email), key=lambda k: k["created"], reverse=True),
+            "max_keys": MAX_KEYS_PER_USER}
+
+@app.post("/me/keys")
+async def me_create_key(request: Request, payload: dict):
+    email = request.state.user_email
+    name  = (payload.get("name") or "").strip()[:60] or "default"
+    if sum(1 for k in _my_keys(email) if k["active"]) >= MAX_KEYS_PER_USER:
+        return JSONResponse(status_code=429, content={"error": {
+            "message": f"Limit reached: {MAX_KEYS_PER_USER} active keys. Revoke one first."}})
+    key = "ak-" + secrets.token_hex(24)
+    API_KEYS[_hash_key(key)] = {
+        "id": key[:11], "name": name, "email": email, "created": _now_iso(),
+        "active": True, "expires": None,
+        "rpm_limit": DEFAULT_RPM_LIMIT, "daily_limit": DEFAULT_DAILY_LIMIT,
+        "requests": 0, "tokens_in": 0, "tokens_out": 0,
+        "last_used": None, "self_service": True,
+    }
+    _save_keys()
+    log.info(f"KEY created via console | {email} | {name} | {key[:11]}...")
+    return {"api_key": key, "id": key[:11], "name": name,
+            "rpm_limit": DEFAULT_RPM_LIMIT, "daily_limit": DEFAULT_DAILY_LIMIT,
+            "note": "Save this key now — it cannot be shown again."}
+
+@app.delete("/me/keys/{key_id}")
+async def me_revoke_key(request: Request, key_id: str):
+    email = request.state.user_email
+    _, info = _find_by_id(key_id)
+    if not info or info.get("email") != email:
+        return JSONResponse(status_code=404, content={"error": {"message": "Key not found"}})
+    info["active"] = False
+    _save_keys()
+    log.info(f"KEY revoked via console | {email} | {info.get('id')}")
+    return {"revoked": True, "id": info.get("id")}
+
+# ── Admin: per-user monitoring ─────────────────────────────
+@app.get("/admin/users")
+async def admin_users():
+    with _db() as conn, conn.cursor() as cur:
+        cur.execute("SELECT email, name, created, active FROM users ORDER BY created")
+        users = cur.fetchall()
+    out = []
+    for u in users:
+        keys = _my_keys(u["email"])
+        out.append({**u, "keys": len(keys),
+                    "active_keys": sum(1 for k in keys if k["active"]),
+                    "requests":   sum(k["requests"] for k in keys),
+                    "tokens_in":  sum(k["tokens_in"] for k in keys),
+                    "tokens_out": sum(k["tokens_out"] for k in keys)})
+    return {"users": out}
+
+# ── Public self-service: Get API Key ──────────────────────
+TRIAL_RPM    = 10     # self-service keys get trial limits;
+TRIAL_DAILY  = 250    # raise per customer from the /keys admin console
+TRIAL_DAYS   = 30
+SIGNUP_PER_IP_PER_DAY = 2
+# Internal-only phase: public signup closed. To open for customers later,
+# start the gateway with AVANIKO_SELF_SIGNUP=1 (or change the default here).
+SELF_SIGNUP_OPEN = os.environ.get("AVANIKO_SELF_SIGNUP", "0") == "1"
+_signups_by_ip = defaultdict(deque)   # ip -> timestamps of issued keys
+
+@app.get("/getkey")
+async def getkey_page():
+    return FileResponse(STATIC / "getkey.html")
+
+@app.post("/signup/key")
+async def self_service_key(request: Request):
+    if not SELF_SIGNUP_OPEN:
+        return JSONResponse(status_code=403, content={"error": {
+            "message": "Self-service signup is currently closed (internal use only). "
+                       "Contact the administrator for an API key."}})
+    ip = _client_ip(request)
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    name  = (payload.get("name") or "").strip()[:60]
+    email = (payload.get("email") or "").strip().lower()[:120]
+    if not name or "@" not in email or "." not in email.split("@")[-1]:
+        return JSONResponse(status_code=400, content={"error": {
+            "message": "Provide your name and a valid email."}})
+
+    # one active key per email
+    for info in API_KEYS.values():
+        if info.get("email") == email and info.get("active"):
+            return JSONResponse(status_code=409, content={"error": {
+                "message": "An active API key already exists for this email. "
+                           "Contact support if you lost it."}})
+
+    # per-IP signup limit
+    now = time.time()
+    win = _signups_by_ip[ip]
+    _prune(win, now - 86_400)
+    if len(win) >= SIGNUP_PER_IP_PER_DAY:
+        return JSONResponse(status_code=429, content={"error": {
+            "message": "Signup limit reached for today. Try again tomorrow."}})
+
+    key = "ak-" + secrets.token_hex(24)
+    expires = (datetime.now(timezone.utc) + timedelta(days=TRIAL_DAYS)) \
+        .strftime("%Y-%m-%dT%H:%M:%S%z")
+    API_KEYS[_hash_key(key)] = {
+        "id":          key[:11],
+        "name":        name,
+        "email":       email,
+        "created":     _now_iso(),
+        "active":      True,
+        "expires":     expires,
+        "rpm_limit":   TRIAL_RPM,
+        "daily_limit": TRIAL_DAILY,
+        "requests":    0,
+        "tokens_in":   0,
+        "tokens_out":  0,
+        "last_used":   None,
+        "self_service": True,
+    }
+    _save_keys()
+    win.append(now)
+    log.info(f"KEY self-service | {name} <{email}> | {key[:11]}... | ip {ip}")
+    return {"api_key": key, "id": key[:11], "name": name,
+            "rpm_limit": TRIAL_RPM, "daily_limit": TRIAL_DAILY, "expires": expires,
+            "note": "Save this key now — it cannot be shown again."}
+
+@app.get("/health")
+async def health():
+    async with httpx.AsyncClient(timeout=5) as c:
+        try:
+            r = await c.get(f"{VLLM_URL}/health")
+            vllm_ok = r.status_code == 200
+        except Exception:
+            vllm_ok = False
+    return {"gateway": "ok", "vllm": "ok" if vllm_ok else "down", "model": PUBLIC_MODEL}
+
+# ── Admin: API key management (master key required) ───────
+def _find_by_id(key_id: str) -> tuple[str, dict] | tuple[None, None]:
+    """Look up a key by its public id (e.g. 'ak-1e0a723a') or full raw key."""
+    by_hash = API_KEYS.get(_hash_key(key_id))
+    if by_hash:
+        return _hash_key(key_id), by_hash
+    for h, info in API_KEYS.items():
+        if info.get("id") == key_id:
+            return h, info
+    return None, None
+
+def _key_summary(info: dict) -> dict:
+    return {"id": info.get("id"), "name": info["name"], "email": info.get("email"),
+            "created": info["created"],
+            "active": info["active"], "expires": info.get("expires"),
+            "rpm_limit": info.get("rpm_limit"), "daily_limit": info.get("daily_limit"),
+            "requests": info.get("requests", 0),
+            "tokens_in": info.get("tokens_in", 0), "tokens_out": info.get("tokens_out", 0),
+            "last_used": info.get("last_used")}
+
+@app.post("/admin/keys")
+async def create_key(payload: dict):
+    name = (payload.get("name") or "").strip()
+    if not name:
+        return JSONResponse(status_code=400,
+                            content={"error": {"message": "Provide a name, e.g. {\"name\": \"customer1\"}"}})
+    expires = None
+    if payload.get("expires_days"):
+        expires = (datetime.now(timezone.utc) + timedelta(days=int(payload["expires_days"]))) \
+            .strftime("%Y-%m-%dT%H:%M:%S%z")
+    key = "ak-" + secrets.token_hex(24)
+    API_KEYS[_hash_key(key)] = {
+        "id":          key[:11],
+        "name":        name,
+        "created":     _now_iso(),
+        "active":      True,
+        "expires":     expires,
+        "rpm_limit":   int(payload.get("rpm_limit", DEFAULT_RPM_LIMIT)),
+        "daily_limit": int(payload.get("daily_limit", DEFAULT_DAILY_LIMIT)),
+        "requests":    0,
+        "tokens_in":   0,
+        "tokens_out":  0,
+        "last_used":   None,
+    }
+    _save_keys()
+    log.info(f"KEY created | {name} | {key[:11]}...")
+    return {"api_key": key, "id": key[:11], "name": name, "expires": expires,
+            "rpm_limit": API_KEYS[_hash_key(key)]["rpm_limit"],
+            "daily_limit": API_KEYS[_hash_key(key)]["daily_limit"],
+            "note": "Save this key now — it is stored hashed and cannot be shown again. "
+                    "It works on /v1/*, /chat, /files/*."}
+
+@app.get("/admin/keys")
+async def list_keys():
+    return {"keys": [_key_summary(v) for v in API_KEYS.values()]}
+
+@app.delete("/admin/keys/{key_id}")
+async def revoke_key(key_id: str):
+    _, info = _find_by_id(key_id)
+    if not info:
+        return JSONResponse(status_code=404, content={"error": {"message": "Key not found"}})
+    info["active"] = False
+    _save_keys()
+    log.info(f"KEY revoked | {info['name']} | {info.get('id')}")
+    return {"revoked": True, "id": info.get("id"), "name": info["name"]}
+
+@app.post("/admin/keys/{key_id}/enable")
+async def enable_key(key_id: str):
+    _, info = _find_by_id(key_id)
+    if not info:
+        return JSONResponse(status_code=404, content={"error": {"message": "Key not found"}})
+    info["active"] = True
+    _save_keys()
+    log.info(f"KEY re-enabled | {info['name']} | {info.get('id')}")
+    return {"enabled": True, "id": info.get("id"), "name": info["name"]}
+
+# ── Key-holder endpoints ──────────────────────────────────
+@app.get("/v1/models")
+async def list_models():
+    return {"object": "list",
+            "data": [{"id": PUBLIC_MODEL, "object": "model", "owned_by": "avaniko"}]}
+
+@app.get("/v1/usage")
+async def my_usage(request: Request):
+    key_hash = getattr(request.state, "key_hash", None)
+    if key_hash is None:  # admin key has no usage record
+        return {"name": "admin", "note": "Master key — usage not tracked. See GET /admin/keys."}
+    return _key_summary(API_KEYS[key_hash])
+
+# ── Files API (SaaS storage: upload once, ask many times) ─
+FILES_DIR = Path(__file__).parent / "files"
+FILES_DIR.mkdir(exist_ok=True)
+MAX_FILE_MB       = 50
+MAX_FILES_PER_KEY = 200
+ALLOWED_EXTS = {"pdf", "png", "jpg", "jpeg", "webp", "bmp", "tiff",
+                "txt", "csv", "md", "json", "html", "docx", "xlsx", "xls"}
+
+def _file_owner(request: Request) -> str:
+    return getattr(request.state, "key_hash", None) or "admin"
+
+def _meta_path(fid: str) -> Path:  return FILES_DIR / f"{fid}.json"
+def _pages_path(fid: str) -> Path: return FILES_DIR / f"{fid}.pages.json"
+
+def _load_meta(fid: str) -> dict | None:
+    p = _meta_path(fid)
+    if not p.exists() or not fid.startswith("file-"):
+        return None
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return None
+
+def _save_meta(meta: dict):
+    _meta_path(meta["id"]).write_text(json.dumps(meta, ensure_ascii=False))
+
+def _owner_metas(owner: str) -> list[dict]:
+    metas = []
+    for p in FILES_DIR.glob("file-*.json"):
+        if p.name.endswith(".pages.json"):
+            continue
+        try:
+            m = json.loads(p.read_text())
+            if owner == "admin" or m.get("owner") == owner:
+                metas.append(m)
+        except Exception:
+            pass
+    return sorted(metas, key=lambda m: m.get("created", ""), reverse=True)
+
+def _meta_public(meta: dict) -> dict:
+    return {k: meta[k] for k in
+            ("id", "filename", "bytes", "pages", "chars", "status", "created", "error")
+            if k in meta}
+
+# ── URL import: Google Sheets / Drive / any direct file link ──
+_CT_EXT = {"application/pdf": "pdf", "text/csv": "csv", "text/plain": "txt",
+           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+           "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+           "image/png": "png", "image/jpeg": "jpg", "text/html": "html"}
+
+def _import_url(url: str) -> tuple[str, str | None]:
+    """Convert share links to direct-download links. Returns (url, forced_name)."""
+    m = re.search(r"docs\.google\.com/spreadsheets/d/([\w-]+)", url)
+    if m:  # Google Sheet → export as xlsx (sheet must be link-shared)
+        return (f"https://docs.google.com/spreadsheets/d/{m.group(1)}/export?format=xlsx",
+                "google-sheet.xlsx")
+    m = re.search(r"drive\.google\.com/file/d/([\w-]+)", url)
+    if m:  # Google Drive file
+        return f"https://drive.google.com/uc?export=download&id={m.group(1)}", None
+    return url, None
+
+async def _fetch_url(url: str) -> tuple[str, bytes]:
+    real, forced = _import_url(url)
+    async with httpx.AsyncClient(timeout=120, follow_redirects=True) as c:
+        r = await c.get(real)
+        r.raise_for_status()
+        if len(r.content) > MAX_FILE_MB * 1024 * 1024:
+            raise ValueError(f"File at URL exceeds {MAX_FILE_MB} MB")
+    fname = forced or url.split("?")[0].rstrip("/").split("/")[-1] or "download"
+    if "." not in fname:
+        ext = _CT_EXT.get(r.headers.get("content-type", "").split(";")[0].strip())
+        if ext:
+            fname += f".{ext}"
+    return fname, r.content
+
+async def _process_file(meta: dict, content: bytes):
+    """Background extraction — big scanned PDFs OCR for minutes; client polls status."""
+    loop = asyncio.get_event_loop()
+    try:
+        pages = await loop.run_in_executor(None, extract_pages, content, meta["filename"])
+        _pages_path(meta["id"]).write_text(json.dumps(pages, ensure_ascii=False))
+        meta.update(status="ready", pages=len(pages), chars=sum(len(p) for p in pages))
+        log.info(f"FILE ready | {meta['id']} | {meta['filename']} | {meta['pages']}p {meta['chars']}ch")
+        try:
+            await _ensure_index(meta["id"])  # RAG index now → first /v1/ask is instant
+        except Exception as e:
+            log.warning(f"RAG index deferred | {meta['id']} | {e}")  # built lazily on first ask
+    except Exception as e:
+        meta.update(status="error", error=str(e))
+        log.error(f"FILE failed | {meta['id']} | {e}")
+    _save_meta(meta)
+
+@app.post("/v1/files")
+async def upload_file(request: Request,
+                      file: UploadFile | None = File(default=None),
+                      url:  str               = Form(default="")):
+    owner = _file_owner(request)
+    if file is not None:
+        content, fname = await file.read(), file.filename
+    elif url.strip():
+        try:
+            fname, content = await _fetch_url(url.strip())
+        except Exception as e:
+            return JSONResponse(status_code=400, content={"error": {
+                "message": f"Could not download from URL: {e}. "
+                           "For Google Sheets/Drive, set sharing to 'Anyone with the link'."}})
+    else:
+        return JSONResponse(status_code=400, content={"error": {
+            "message": "Send a file upload or a 'url' form field "
+                       "(Google Sheets / Drive links supported)."}})
+    ext = (fname or "").lower().rsplit(".", 1)[-1]
+    if ext not in ALLOWED_EXTS:
+        return JSONResponse(status_code=400, content={"error": {
+            "message": f"Unsupported file type .{ext}. Allowed: {', '.join(sorted(ALLOWED_EXTS))}"}})
+    if len(content) > MAX_FILE_MB * 1024 * 1024:
+        return JSONResponse(status_code=413, content={"error": {
+            "message": f"File too large. Max {MAX_FILE_MB} MB."}})
+    if owner != "admin" and len(_owner_metas(owner)) >= MAX_FILES_PER_KEY:
+        return JSONResponse(status_code=429, content={"error": {
+            "message": f"File limit reached ({MAX_FILES_PER_KEY}). Delete old files first."}})
+
+    fid  = "file-" + secrets.token_hex(8)
+    meta = {"id": fid, "owner": owner, "filename": fname,
+            "bytes": len(content), "pages": None, "chars": None,
+            "status": "processing", "created": _now_iso(), "error": None}
+    _save_meta(meta)
+    asyncio.create_task(_process_file(meta, content))
+    return {**_meta_public(meta),
+            "note": "Extraction running. Poll GET /v1/files/{id} until status=ready, "
+                    "then POST /v1/files/{id}/ask with {\"question\": \"...\"}."}
+
+@app.get("/v1/files")
+async def list_files(request: Request):
+    return {"data": [_meta_public(m) for m in _owner_metas(_file_owner(request))]}
+
+@app.get("/v1/files/{fid}")
+async def get_file(request: Request, fid: str):
+    meta = _load_meta(fid)
+    owner = _file_owner(request)
+    if not meta or (owner != "admin" and meta.get("owner") != owner):
+        return JSONResponse(status_code=404, content={"error": {"message": "File not found"}})
+    return _meta_public(meta)
+
+@app.delete("/v1/files/{fid}")
+async def delete_file(request: Request, fid: str):
+    meta = _load_meta(fid)
+    owner = _file_owner(request)
+    if not meta or (owner != "admin" and meta.get("owner") != owner):
+        return JSONResponse(status_code=404, content={"error": {"message": "File not found"}})
+    _meta_path(fid).unlink(missing_ok=True)
+    _pages_path(fid).unlink(missing_ok=True)
+    (FILES_DIR / f"{fid}.vec.npy").unlink(missing_ok=True)
+    (FILES_DIR / f"{fid}.rag.json").unlink(missing_ok=True)
+    _VEC_CACHE.pop(fid, None)
+    return {"deleted": True, "id": fid}
+
+@app.post("/v1/files/{fid}/ask")
+async def ask_file(request: Request, fid: str):
+    meta  = _load_meta(fid)
+    owner = _file_owner(request)
+    if not meta or (owner != "admin" and meta.get("owner") != owner):
+        return JSONResponse(status_code=404, content={"error": {"message": "File not found"}})
+    if meta["status"] == "processing":
+        return JSONResponse(status_code=409, content={"error": {
+            "message": "File still processing. Poll GET /v1/files/{id} until status=ready."}})
+    if meta["status"] == "error":
+        return JSONResponse(status_code=422, content={"error": {
+            "message": f"File extraction failed: {meta.get('error')}"}})
+
+    payload  = await request.json()
+    question = (payload.get("question") or "").strip()
+    if not question:
+        return JSONResponse(status_code=400, content={"error": {
+            "message": "Provide a question, e.g. {\"question\": \"Summarize this document\"}"}})
+
+    pages = json.loads(_pages_path(fid).read_text())
+    start = time.time()
+    answer, strategy, calls = await answer_document(
+        meta["filename"], pages, question, getattr(request.state, "key_hash", None))
+    ms = int((time.time() - start) * 1000)
+    _append_jsonl(CONTENT_LOG, {"type": "file-ask", "ip": _client_ip(request),
+                                "file_id": fid, "filename": meta["filename"],
+                                "pages": meta["pages"], "strategy": strategy,
+                                "question": question, "answer": answer, "ms": ms})
+    return {"id": fid, "filename": meta["filename"], "question": question,
+            "answer": answer, "strategy": strategy,
+            "pages": meta["pages"], "llm_calls": calls, "ms": ms}
+
+# ── RAG: ask across ALL your documents (constant token cost) ──
+@app.post("/v1/ask")
+async def rag_ask(request: Request):
+    """{"question": "...", "file_ids": [...]?, "stream": true?}
+    Searches every ready document the key owns (or just file_ids),
+    sends only the top chunks to the LLM — token limit can never overflow."""
+    owner    = _file_owner(request)
+    key_hash = getattr(request.state, "key_hash", None)
+    payload  = await request.json()
+    question = (payload.get("question") or "").strip()
+    if not question:
+        return JSONResponse(status_code=400, content={"error": {
+            "message": "Provide a question, e.g. {\"question\": \"...\"}"}})
+
+    metas = [m for m in _owner_metas(owner) if m.get("status") == "ready"]
+    if payload.get("file_ids"):
+        wanted = set(payload["file_ids"])
+        metas = [m for m in metas if m["id"] in wanted]
+    if not metas:
+        return JSONResponse(status_code=404, content={"error": {
+            "message": "No ready documents found. Upload via POST /v1/files first."}})
+
+    start = time.time()
+    hits  = await rag_retrieve(metas, question,
+                               top_k=min(int(payload.get("top_k", RAG_TOP_K)), 10))
+    if not hits:
+        return JSONResponse(status_code=422, content={"error": {
+            "message": "Documents contain no searchable text."}})
+    sources  = [{k: h[k] for k in ("file_id", "filename", "page", "score")} for h in hits]
+    messages = _rag_messages(hits, question)
+    ip       = _client_ip(request)
+
+    # Streaming (Claude-style live tokens) — SSE, OpenAI chunk format,
+    # with one extra final event carrying the sources.
+    if payload.get("stream"):
+        async def stream():
+            full = ""
+            async for raw in _llm_sse(messages, key_hash):
+                try:
+                    obj = json.loads(raw)
+                    if obj.get("choices"):
+                        full += obj["choices"][0]["delta"].get("content") or ""
+                except Exception:
+                    pass
+                yield f"data: {raw}\n\n"
+            yield f"data: {json.dumps({'sources': sources})}\n\n"
+            yield "data: [DONE]\n\n"
+            _append_jsonl(CONTENT_LOG, {"type": "rag-ask", "ip": ip, "stream": True,
+                                        "files": len(metas), "question": question,
+                                        "answer": full, "sources": sources,
+                                        "ms": int((time.time() - start) * 1000)})
+        return StreamingResponse(stream(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache",
+                                          "X-Accel-Buffering": "no"})
+
+    answer = await _llm(messages, key_hash, max_tokens=8192)
+    ms = int((time.time() - start) * 1000)
+    _append_jsonl(CONTENT_LOG, {"type": "rag-ask", "ip": ip, "stream": False,
+                                "files": len(metas), "question": question,
+                                "answer": answer, "sources": sources, "ms": ms})
+    return {"question": question, "answer": answer, "sources": sources,
+            "documents_searched": len(metas), "ms": ms}
+
+# ── Batch: multiple PDFs in ONE request → JSON per file ──
+MAX_BATCH_FILES = 20
+
+@app.post("/v1/extract")
+async def batch_extract(request: Request,
+                        files: list[UploadFile] = File(...),
+                        question: str = Form(default="Extract all information as structured JSON")):
+    if len(files) > MAX_BATCH_FILES:
+        return JSONResponse(status_code=400, content={"error": {
+            "message": f"You sent {len(files)} files — max {MAX_BATCH_FILES} per request. "
+                       f"Split into batches of {MAX_BATCH_FILES}, or upload each file once "
+                       "via POST /v1/files and ask unlimited questions with POST /v1/ask."}})
+    key_hash = getattr(request.state, "key_hash", None)
+    loop  = asyncio.get_event_loop()
+    start = time.time()
+
+    # process files in parallel — vLLM batches the LLM calls on the GPU,
+    # so 10 files take barely longer than the slowest one (not the sum)
+    sem = asyncio.Semaphore(5)
+    async def process(fname: str, content: bytes) -> dict:
+        if len(content) > MAX_FILE_MB * 1024 * 1024:
+            return {"filename": fname, "error": f"File too large (max {MAX_FILE_MB} MB)"}
+        async with sem:
+            try:
+                pages = await loop.run_in_executor(None, extract_pages, content, fname)
+                if not sum(len(p.strip()) for p in pages):
+                    return {"filename": fname, "error":
+                            "No readable text could be extracted from this file "
+                            "(image quality too low or OCR failed). Try a clearer scan."}
+                answer, strategy, _ = await answer_document(fname, pages, question, key_hash)
+                return {"filename": fname, "pages": len(pages),
+                        "strategy": strategy, "answer": answer}
+            except Exception as e:
+                return {"filename": fname, "error": str(e)[:300]}
+
+    contents = [(f.filename, await f.read()) for f in files]
+    results  = list(await asyncio.gather(*[process(fn, c) for fn, c in contents]))
+    ms = int((time.time() - start) * 1000)
+    _append_jsonl(CONTENT_LOG, {"type": "batch-extract", "ip": _client_ip(request),
+                                "files": [f.filename for f in files],
+                                "question": question, "results": results, "ms": ms})
+    return {"question": question, "results": results,
+            "files": len(files), "ms": ms}
+
+# ── Chat completions (proxy to vLLM, streaming) ───────────
+# Code/Tamil text tokenizes at ~2.5 chars/token, so the char budget must be
+# conservative: 60k chars ≈ 24k tokens worst case, leaving room for output.
+MAX_INPUT_CHARS = 60_000
+
+def _fit_messages(msgs: list, limit: int = MAX_INPUT_CHARS) -> list:
+    """Never let a chatbot's growing history hit the token limit: keep system
+    messages + the newest turns, drop the oldest middle until it fits."""
+    def size(ms): return sum(len(str(m.get("content") or "")) for m in ms)
+    if size(msgs) <= limit:
+        return msgs
+    system = [m for m in msgs if m.get("role") == "system"]
+    rest   = [m for m in msgs if m.get("role") != "system"]
+    while len(rest) > 1 and size(system) + size(rest) > limit:
+        rest.pop(0)
+    if rest and size(system) + size(rest) > limit:  # one giant message
+        m = dict(rest[-1])
+        budget = max(limit - size(system), 2000)
+        c = str(m.get("content") or "")
+        m["content"] = c[:budget // 2] + "\n...[trimmed]...\n" + c[-budget // 2:]
+        rest[-1] = m
+    log.info(f"CHAT history trimmed to fit context ({len(msgs)} → {len(system) + len(rest)} messages)")
+    return system + rest
+
+# ── Web search tool (DuckDuckGo — no API key) ─────────────
+WEB_RESULTS = 5
+
+def _web_search_sync(query: str) -> list[dict]:
+    from ddgs import DDGS
+    try:
+        return list(DDGS().text(query, max_results=WEB_RESULTS))
+    except Exception as e:
+        log.error(f"WEBSEARCH failed | {e}")
+        return []
+
+async def _needs_web(messages: list) -> bool:
+    """Ask the model itself whether the question needs live/current web data.
+    Fully dynamic — no fixed keyword list. One tiny, fast classification call."""
+    question = ""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            question = str(m.get("content") or "")
+            break
+    if not question.strip() or len(question) > 2000:  # huge pastes = document task
+        return False
+    judge = [
+        {"role": "system", "content":
+            "Decide if answering the user's message needs CURRENT information from "
+            "the internet. Answer YES if it asks about anything that changes over "
+            "time or that you might be out of date on: today's date/news/events, "
+            "current prices/stocks/rates, weather, live scores, OR the 'latest' / "
+            "'current' / 'newest' version, release, price, leader, or status of "
+            "anything. Answer NO for timeless knowledge: math, coding, definitions, "
+            "explanations, reasoning, writing, translation.\n"
+            "Examples:\n"
+            "'latest version of python' -> YES\n"
+            "'who is the current CEO of Google' -> YES\n"
+            "'todays weather in chennai' -> YES\n"
+            "'write a sql query to join two tables' -> NO\n"
+            "'explain how TCP works' -> NO\n"
+            "'reverse a linked list in java' -> NO\n"
+            "Reply with exactly one word: YES or NO."},
+        {"role": "user", "content": question[:1500]},
+    ]
+    try:
+        body = {"model": MODEL, "messages": judge, "max_tokens": 3,
+                "temperature": 0, "chat_template_kwargs": {"enable_thinking": False}}
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.post(f"{VLLM_URL}/v1/chat/completions", json=body)
+            ans = r.json()["choices"][0]["message"].get("content", "")
+        return "yes" in ans.strip().lower()
+    except Exception as e:
+        log.warning(f"web-need classifier failed, defaulting to no-web: {e}")
+        return False
+
+async def _web_context(messages: list, key_hash: str | None) -> str | None:
+    """Search the web for the user's last question; return a context block."""
+    question = ""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            question = str(m.get("content") or "")[:300]
+            break
+    if not question.strip():
+        return None
+    loop    = asyncio.get_event_loop()
+    results = await loop.run_in_executor(None, _web_search_sync, question)
+    if not results:
+        return None
+    blocks = [f"[{i}] {r.get('title','')}\nURL: {r.get('href','')}\n{r.get('body','')}"
+              for i, r in enumerate(results, 1)]
+    log.info(f"WEBSEARCH | {question[:60]} | {len(results)} results")
+    return ("Live web search results (retrieved just now):\n\n" + "\n\n".join(blocks) +
+            "\n\nUse these results to answer the user's question. "
+            "Cite sources as [1], [2] etc. If the results don't contain the "
+            "answer, say so — do not invent facts.")
+
+# ── User accounts (@avaniko.com only) — Gemini-style console ──
+import re
+ALLOWED_EMAIL_RE  = re.compile(r"^[A-Za-z0-9._%+-]+@avaniko\.com$", re.I)
+SESSION_DAYS      = 7
+MAX_KEYS_PER_USER = 3
+_SESSIONS: dict = {}   # token_hash -> (email, expires_epoch)
+
+def _pw_hash(password: str, salt: str | None = None) -> str:
+    salt = salt or secrets.token_hex(16)
+    h = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 200_000).hex()
+    return f"{salt}${h}"
+
+def _pw_verify(password: str, stored: str) -> bool:
+    try:
+        salt, _ = stored.split("$", 1)
+        return secrets.compare_digest(_pw_hash(password, salt), stored)
+    except Exception:
+        return False
+
+def _session_create(email: str) -> str:
+    token = "st-" + secrets.token_hex(24)
+    th, exp = _hash_key(token), time.time() + SESSION_DAYS * 86_400
+    _SESSIONS[th] = (email, exp)
+    try:
+        with _db() as conn, conn.cursor() as cur:
+            cur.execute("INSERT INTO sessions (token_hash, email, created, expires) "
+                        "VALUES (%s,%s,%s,%s)", (th, email, _now_iso(), exp))
+    except Exception as e:
+        log.error(f"session persist failed: {e}")
+    return token
+
+def _session_email(token: str) -> str | None:
+    if not token.startswith("st-"):
+        return None
+    th = _hash_key(token)
+    hit = _SESSIONS.get(th)
+    if hit is None:  # not cached (e.g. after restart) — check MySQL
+        try:
+            with _db() as conn, conn.cursor() as cur:
+                cur.execute("SELECT email, expires FROM sessions WHERE token_hash=%s", (th,))
+                row = cur.fetchone()
+            hit = (row["email"], row["expires"]) if row else ("", 0)
+        except Exception:
+            hit = ("", 0)
+        _SESSIONS[th] = hit
+    email, exp = hit
+    return email if email and exp > time.time() else None
+
+def _session_destroy(token: str):
+    th = _hash_key(token)
+    _SESSIONS.pop(th, None)
+    try:
+        with _db() as conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM sessions WHERE token_hash=%s", (th,))
+    except Exception:
+        pass
+
+def _user_get(email: str) -> dict | None:
+    with _db() as conn, conn.cursor() as cur:
+        cur.execute("SELECT * FROM users WHERE email=%s", (email,))
+        return cur.fetchone()
+
+def _merge_system(messages: list) -> list:
+    """Qwen's template requires a single system message at position 0 —
+    merge all system contents (ours + the client's) into one."""
+    sys_parts = [str(m.get("content") or "") for m in messages if m.get("role") == "system"]
+    rest      = [m for m in messages if m.get("role") != "system"]
+    if not sys_parts:
+        return rest
+    return [{"role": "system", "content": "\n\n".join(p for p in sys_parts if p)}] + rest
+
+# Per-skill presets — pass "task": "<name>" and get tuned settings without
+# knowing the knobs. Explicit client params always win over the preset.
+TASK_PRESETS = {
+    "extraction": {"temperature": 0.1, "max_tokens": 2048, "thinking": False},  # OCR/invoice→JSON: deterministic, compact
+    "coding":     {"temperature": 0.2, "max_tokens": 8192, "thinking": False},  # precise, room for long code
+    "reasoning":  {"temperature": 0.6, "max_tokens": 8192, "thinking": True},   # hard problems: thinking ON
+    "chat":       {"temperature": 0.7, "max_tokens": 4096, "thinking": False},
+    "classification": {"temperature": 0.0, "max_tokens": 256, "thinking": False},  # labels: fast + deterministic
+}
+
+async def _detect_task(messages: list) -> str:
+    """Dynamically pick the best preset for the user's message — the model
+    classifies its own task type. Used when client sends task='auto'."""
+    question = ""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            question = str(m.get("content") or "")
+            break
+    if not question.strip():
+        return "chat"
+    if len(question) > 4000:   # large pasted content → extraction
+        return "extraction"
+    judge = [
+        {"role": "system", "content":
+            "Classify the user's message into ONE category and reply with that "
+            "single word only:\n"
+            "coding - writing/debugging/explaining code or queries\n"
+            "reasoning - math, logic, multi-step problem solving, analysis\n"
+            "extraction - pulling structured data/JSON from text or documents\n"
+            "classification - labelling/categorizing/sentiment\n"
+            "chat - general conversation, questions, writing, everything else"},
+        {"role": "user", "content": question[:1500]},
+    ]
+    try:
+        body = {"model": MODEL, "messages": judge, "max_tokens": 4,
+                "temperature": 0, "chat_template_kwargs": {"enable_thinking": False}}
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.post(f"{VLLM_URL}/v1/chat/completions", json=body)
+            ans = r.json()["choices"][0]["message"].get("content", "").strip().lower()
+        for t in TASK_PRESETS:
+            if t in ans:
+                return t
+    except Exception as e:
+        log.warning(f"task classifier failed: {e}")
+    return "chat"
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request):
+    body = await request.json()
+    # white-label: clients send "avaniko-ai" (or anything) — we serve our
+    # engine and stamp PUBLIC_MODEL on every response
+    body["model"] = MODEL
+    # Gemini/GPT-style: one key, every skill works automatically. With no
+    # "task" given we default to "auto" — the model classifies its own task
+    # (chat / reasoning / coding / extraction) and gets the right temperature
+    # + thinking-mode, so reasoning questions think and chat stays fast.
+    # Explicit client params ALWAYS win; auto never reduces max_tokens.
+    task = str(body.pop("task", "auto")).lower()
+    client_set_thinking = "chat_template_kwargs" in body
+    if task == "auto" and isinstance(body.get("messages"), list):
+        try:
+            task = await _detect_task(body["messages"])
+            log.info(f"CHAT | auto task: {task}")
+        except Exception as e:
+            log.warning(f"auto task failed → chat: {e}")
+            task = "chat"
+    preset = TASK_PRESETS.get(task)
+    if preset:
+        body.setdefault("temperature", preset["temperature"])
+        if not client_set_thinking:
+            body["chat_template_kwargs"] = {"enable_thinking": preset["thinking"]}
+    # clean answers by default if still nothing chose thinking mode
+    body.setdefault("chat_template_kwargs", {"enable_thinking": False})
+    # max_tokens: respect the client; otherwise give generous headroom so an
+    # answer is NEVER truncated (presets no longer shrink this)
+    if body.get("max_tokens") is None or body["max_tokens"] > MAX_TOKENS_CAP:
+        body["max_tokens"] = MAX_TOKENS_CAP
+    if isinstance(body.get("messages"), list):
+        # web_search: true = force, false = never, "auto"/absent = decide by query
+        ws = body.pop("web_search", "auto")
+        use_web = ws is True or (ws == "auto" and await _needs_web(body["messages"]))
+        if use_web:
+            ctx = await _web_context(body["messages"],
+                                     getattr(request.state, "key_hash", None))
+            if ctx:
+                body["messages"] = _merge_system(
+                    [{"role": "system", "content": ctx}] + body["messages"])
+        body["messages"] = _fit_messages(body["messages"])
+    stream   = body.get("stream", False)
+    ip       = _client_ip(request)
+    key_hash = getattr(request.state, "key_hash", None)
+    start    = time.time()
+
+    async def event_stream():
+        raw = b""
+        async with httpx.AsyncClient(timeout=300) as c:
+            async with c.stream("POST", f"{VLLM_URL}/v1/chat/completions",
+                                json=body) as r:
+                if r.status_code != 200:  # surface the real error, never an empty stream
+                    detail = (await r.aread()).decode("utf-8", errors="ignore")[:400]
+                    yield f'data: {json.dumps({"error": {"message": detail, "type": "invalid_request_error"}})}\n\n'.encode()
+                    yield b"data: [DONE]\n\n"
+                    return
+                async for chunk in r.aiter_bytes():
+                    raw += chunk
+                    yield chunk.replace(f'"model":"{MODEL}"'.encode(),
+                                        f'"model":"{PUBLIC_MODEL}"'.encode())
+        # reassemble streamed answer for the content log
+        answer, usage = "", None
+        for line in raw.decode("utf-8", errors="ignore").splitlines():
+            if line.startswith("data:") and line[5:].strip() not in ("", "[DONE]"):
+                try:
+                    obj = json.loads(line[5:])
+                    usage = obj.get("usage") or usage
+                    if obj.get("choices"):
+                        answer += obj["choices"][0]["delta"].get("content") or ""
+                except Exception:
+                    pass
+        _record_tokens(key_hash, usage)
+        _append_jsonl(CONTENT_LOG, {"type": "chat", "ip": ip, "stream": True,
+                                    "messages": body.get("messages", []),
+                                    "answer": answer, "usage": usage,
+                                    "ms": int((time.time() - start) * 1000)})
+
+    if stream:
+        return StreamingResponse(event_stream(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache",
+                                          "X-Accel-Buffering": "no"})
+
+    async with httpx.AsyncClient(timeout=300) as c:
+        r = await c.post(f"{VLLM_URL}/v1/chat/completions", json=body)
+        data = r.json()
+        if r.status_code == 400 and "maximum context length" in json.dumps(data):
+            # tokenizer counted more than our char estimate — trim harder, retry once
+            if isinstance(body.get("messages"), list):
+                body["messages"] = _fit_messages(body["messages"], MAX_INPUT_CHARS // 2)
+            r = await c.post(f"{VLLM_URL}/v1/chat/completions", json=body)
+            data = r.json()
+        try:
+            answer = data["choices"][0]["message"].get("content", "")
+        except Exception:
+            answer = ""
+        _record_tokens(key_hash, data.get("usage"))
+        _append_jsonl(CONTENT_LOG, {"type": "chat", "ip": ip, "stream": False,
+                                    "messages": body.get("messages", []),
+                                    "answer": answer, "usage": data.get("usage"),
+                                    "ms": int((time.time() - start) * 1000)})
+        if "model" in data:
+            data["model"] = PUBLIC_MODEL
+        # pass the real status through — a vLLM error must never look like a 200
+        return JSONResponse(data, status_code=r.status_code)
+
+# ── Simple text chat (SSE helper used by the HTML UI) ─────
+@app.post("/chat")
+async def chat(request: Request):
+    payload  = await request.json()
+    messages = _fit_messages(payload.get("messages", []))
+    model    = payload.get("model", MODEL)
+
+    # UI chat always knows today's date; web search auto-triggers on live
+    # questions, or is forced when the 🌐 toggle is on.
+    ws = payload.get("web_search", "auto")
+    if ws is True or (ws == "auto" and await _needs_web(messages)):
+        ctx = await _web_context(messages, getattr(request.state, "key_hash", None))
+        if ctx:
+            messages = [{"role": "system", "content": ctx}] + messages
+            log.info("CHAT | auto web-search triggered")
+    messages = _merge_system(
+        [{"role": "system", "content":
+          f"Current date and time: {time.strftime('%A, %d %B %Y, %H:%M UTC')}."}] + messages)
+    ip       = _client_ip(request)
+    start    = time.time()
+
+    async def stream():
+        full = ""
+        body = {"model": model, "messages": messages, "stream": True,
+                "chat_template_kwargs": {"enable_thinking": False}}
+        async with httpx.AsyncClient(timeout=300) as c:
+            async with c.stream("POST", f"{VLLM_URL}/v1/chat/completions",
+                                json=body) as r:
+                async for line in r.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    raw = line[5:].strip()
+                    if raw == "[DONE]":
+                        yield "data: [DONE]\n\n"
+                        break
+                    try:
+                        token = json.loads(raw)["choices"][0]["delta"].get("content", "")
+                        if token:
+                            full += token
+                            yield f"data: {json.dumps({'token': token})}\n\n"
+                    except Exception:
+                        pass
+        _append_jsonl(CONTENT_LOG, {"type": "chat-ui", "ip": ip,
+                                    "messages": messages, "answer": full,
+                                    "ms": int((time.time() - start) * 1000)})
+
+    return StreamingResponse(stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
+
+# ── File chat (OCR → vLLM) ────────────────────────────────
+@app.post("/files/ask")
+async def files_ask(
+    request:  Request,
+    files:    list[UploadFile] = File(default=None),
+    file:     UploadFile       = File(default=None),   # old single-file clients
+    question: str              = Form(default="Extract all information as JSON"),
+):
+    uploads = list(files or [])
+    if file:
+        uploads.append(file)
+    if not uploads:
+        return JSONResponse(status_code=400, content={"error": {"message": "Attach at least one file."}})
+    if len(uploads) > MAX_BATCH_FILES:
+        return JSONResponse(status_code=400, content={"error": {
+            "message": f"You attached {len(uploads)} files — max {MAX_BATCH_FILES} at once. "
+                       "Send the rest in a second message."}})
+
+    start    = time.time()
+    ip       = _client_ip(request)
+    key_hash = getattr(request.state, "key_hash", None)
+    loop     = asyncio.get_event_loop()
+
+    # read uploads NOW (fast) — all slow work happens inside the stream below,
+    # with progress events every few seconds so the RunPod proxy (which cuts
+    # connections silent for ~100s) never times out on big scanned PDFs.
+    contents = [(f.filename, await f.read()) for f in uploads]
+    nbytes   = sum(len(c) for _, c in contents)
+
+    async def _await_with_progress(coro, label):
+        """Run coro while yielding a status event every 4s. Yields ('status', ...)
+        events, finally ('done', result)."""
+        task = asyncio.ensure_future(coro)
+        while True:
+            try:
+                result = await asyncio.wait_for(asyncio.shield(task), timeout=4)
+                yield ("done", result)
+                return
+            except asyncio.TimeoutError:
+                yield ("status", f"{label} ({int(time.time() - start)}s)")
+
+    async def stream():
+        full, fname, total = "", "", 0
+        try:
+            # 1) extraction (OCR can take minutes on scanned PDFs)
+            async def extract_all():
+                pages, names = [], []
+                for fn, content in contents:
+                    fpages = await loop.run_in_executor(None, extract_pages, content, fn)
+                    if len(contents) > 1:  # label pages so answers cite the right file
+                        fpages = [f"[File: {fn}]\n{p}" for p in fpages]
+                    pages.extend(fpages)
+                    names.append(fn)
+                return pages, names
+
+            yield f"data: {json.dumps({'status': 'Reading documents…'})}\n\n"
+            async for kind, val in _await_with_progress(extract_all(), "Reading documents…"):
+                if kind == "status":
+                    yield f"data: {json.dumps({'status': val})}\n\n"
+                else:
+                    pages, names = val
+
+            fname = names[0] if len(names) == 1 else f"{len(names)} files ({', '.join(names)})"
+            total = sum(len(p) for p in pages)
+            if not total:
+                pages = [f"[{fname}: no readable text could be extracted.]"]
+                total = len(pages[0])
+            log.info(f"FILE | {fname} | {len(pages)}p {total}ch → vLLM")
+
+            # 2) map phase for big docs (also slow — keep the events flowing)
+            if total <= SINGLE_SHOT_CHARS:
+                messages = _doc_messages(fname, _pages_text(pages), question)
+            else:
+                chunks = _chunk_pages(pages)
+                log.info(f"FILE | {fname} | map_reduce over {len(chunks)} chunks")
+                label = f"Analyzing {len(chunks)} sections…"
+                async for kind, val in _await_with_progress(
+                        _map_chunks(fname, chunks, question, key_hash), label):
+                    if kind == "status":
+                        yield f"data: {json.dumps({'status': val})}\n\n"
+                    else:
+                        partials = val
+                messages = _reduce_messages(fname, partials, question)
+
+            # 3) stream the final answer
+            body = {"model": MODEL, "messages": messages, "stream": True,
+                    "max_tokens": 8192,
+                    "chat_template_kwargs": {"enable_thinking": False}}
+            async with httpx.AsyncClient(timeout=300) as c:
+                async with c.stream("POST", f"{VLLM_URL}/v1/chat/completions",
+                                    json=body) as r:
+                    if r.status_code != 200:
+                        detail = (await r.aread()).decode("utf-8", errors="ignore")[:300]
+                        yield f"data: {json.dumps({'error': {'message': detail}})}\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
+                    async for line in r.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        raw = line[5:].strip()
+                        if raw == "[DONE]":
+                            yield "data: [DONE]\n\n"
+                            break
+                        try:
+                            token = json.loads(raw)["choices"][0]["delta"].get("content", "")
+                            if token:
+                                full += token
+                                yield f"data: {json.dumps({'token': token})}\n\n"
+                        except Exception:
+                            pass
+        except Exception as e:
+            log.exception(f"FILE ask failed | {fname}")
+            yield f"data: {json.dumps({'error': {'message': str(e)[:300]}})}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+        _append_jsonl(CONTENT_LOG, {"type": "file", "ip": ip,
+                                    "filename": fname, "file_bytes": nbytes,
+                                    "ocr_chars": total, "question": question,
+                                    "answer": full,
+                                    "ms": int((time.time() - start) * 1000)})
+
+    return StreamingResponse(stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})

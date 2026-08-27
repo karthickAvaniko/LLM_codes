@@ -1,0 +1,98 @@
+# ── Secrets — NEVER commit ───────────────────────────────
+.env
+*.env
+.env.local
+.env.production
+.s3_env
+.mysql_env
+.api_key
+*_KEY*.txt
+*_key*.txt
+OFFICE_PROJECT_KEY.txt
+keys.json*
+**/secrets/
+
+# ── Python ────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+venv/
+env/
+.venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+*.so
+
+# ── Logs ─────────────────────────────────────────────────
+logs/
+*.log
+*.pid
+
+# ── Uploads & Vector DB (runtime data) ───────────────────
+production/uploads/
+production/vectordb/
+production/models/
+
+# ── Node / Frontend ───────────────────────────────────────
+node_modules/
+frontend/dist/
+frontend/.vite/
+.npm/
+
+# ── SSL Certificates ──────────────────────────────────────
+nginx/ssl/
+*.pem
+*.key
+*.crt
+
+# ── Database files ────────────────────────────────────────
+*.db
+*.sqlite
+mysql/
+avaniko_db.sql
+
+# ── Model weights (huge — never commit) ──────────────────
+models/
+*.safetensors
+*.gguf
+*.bin
+
+# ── Caches, archives, backups (huge — never commit) ──────
+.cache/
+.ipynb_checkpoints/
+__pycache__/
+*.zip
+avaniko-project.zip
+backups/
+
+# ── Runtime storage / uploads (not source code) ──────────
+gateway/files/
+gateway/static/uploads/
+Untitled Folder/
+Untitled Folder 1/
+
+# ── OS ───────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+*.tmp
+
+# ── IDE ──────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Workspace level (not project files) ──────────────────
+venv/
+models/
+setup.sh
+test.jpg
+test.pdf
+db_setup.sql
+avaniko-gateway/
+.git_old_backup/
