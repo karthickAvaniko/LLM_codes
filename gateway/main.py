@@ -734,11 +734,24 @@ EXTRACTION_RULES = (
     "never invented to make the row look complete. Where both quantity and "
     "unit price are present, they should multiply to approximately the "
     "stated amount. A description with NO quantity and NO amount of its own "
-    "in the source is NOT a line item — do not split it into its own row, "
-    "and do not borrow a different row's amount to give it one; either merge "
-    "that text into the description of the item it actually belongs to (see "
-    "multi-line rule below), or place it in \"metadata\" if it isn't part of "
-    "any item's description at all. If a row's values are not actually "
+    "in the source is NOT a line item ONLY when that text does not itself "
+    "sit in the table's own row/column structure — e.g. a stray annotation, "
+    "PO note, or continuation phrase that isn't aligned in the Description "
+    "column the same way its neighboring rows are. In that case, do not "
+    "split it into its own row, and do not borrow a different row's amount "
+    "to give it one; either merge that text into the description of the "
+    "item it actually belongs to (see multi-line rule below), or place it "
+    "in \"metadata\" if it isn't part of any item's description at all. "
+    "BUT: a row that DOES sit in the table's own structure — same Description/"
+    "Amount columns, same row pattern as the rows above and below it — stays "
+    "its OWN separate line item even when its amount cell is blank/empty; a "
+    "missing charge is not the same as not being a row. NEVER merge such a "
+    "row's description into the NEXT or PREVIOUS row just because this row's "
+    "own amount is blank — map each amount ONLY to the description on its "
+    "own same visual row, using column alignment and row position, never OCR "
+    "text adjacency — a blank-amount row sitting between two priced rows "
+    "must never have its description concatenated onto either neighbor, and "
+    "must never inherit a neighbor's amount. If a row's values are not actually "
     "supported by the source table this way, reject it — leave it out of "
     "line_items rather than fabricating a quantity, price, or amount to fit. "
     "Hard rule: if item/description, quantity, unit price, AND amount are "
@@ -936,7 +949,20 @@ EXTRACTION_RULES = (
     "document (e.g. a monthly account statement) — that row's date is a "
     "transaction/posting date for the STATEMENT, not the invoice's own date, "
     "even if it's the only date near that invoice number in the whole "
-    "document. Prefer the date printed once in the invoice's own header.\n"
+    "document. Prefer the date printed once in the invoice's own header. "
+    "This also applies to an UNLABELLED/floating date — one with no date-"
+    "concept label of its own — sitting near an internal filing/reference "
+    "code (e.g. a bare \"V000107\"-style stamp) or embedded inside a GL/"
+    "accounting/expense note (e.g. \"...NJ-MW DOM 7030 Software Subscription "
+    "Expense OI 10/09/23\"): that is NEVER the invoice's own date, even when "
+    "it is the ONLY date visible on that page/section and even when a "
+    "properly-labelled date (\"Invoice Date\", \"Invoice Generation Date\", "
+    "\"Issued\"/\"Issue Date\") is on a different page of the same document. "
+    "Actively prefer a labelled date elsewhere in the document over an "
+    "unlabelled one that happens to be closer — never fill invoice_date with "
+    "the unlabelled/GL-embedded date just because nothing else was visible "
+    "on that particular page; leave it out for that section instead and let "
+    "another page's labelled date supply it.\n"
     "- Date format: normalize every date field to ISO 8601 (YYYY-MM-DD) when "
     "the source format is unambiguous (e.g. '30-Nov-2023' -> '2023-11-30'). "
     "Use the document's own locale/other dates to resolve DD/MM vs MM/DD; if "
@@ -2758,9 +2784,15 @@ MAX_CONSISTENCY_SAMPLES = 5
 _INVOICE_NUMBER_KEYS_FOR_VOTE = ("invoice_number", "invoice_no", "invoice_num")
 _CRITICAL_FIELD_TASK = (
     "From this document, extract ONLY these values as a small flat JSON object: "
-    "the invoice number, the subtotal, the tax amount, and the grand total / "
-    "balance due. Use exactly these keys: \"invoice_number\", \"subtotal\", "
-    "\"tax\", \"total\". Use null for any that are genuinely not present in the "
+    "the invoice number, the invoice's own primary date, the subtotal, the tax "
+    "amount, and the grand total / balance due. Use exactly these keys: "
+    "\"invoice_number\", \"invoice_date\", \"subtotal\", \"tax\", \"total\". "
+    "For invoice_date: use only a date explicitly labelled as this document's "
+    "own issue/generation date (e.g. \"Invoice Date\", \"Invoice Generation "
+    "Date\", \"Issued\"/\"Issue Date\") — never an unlabelled/floating date, "
+    "never one embedded inside a GL/accounting/expense reference note, and "
+    "never an email or due date, even if it's the only date visible. Format "
+    "as YYYY-MM-DD. Use null for any value genuinely not present in the "
     "document. Return ONLY the JSON object, nothing else."
 )
 
@@ -2790,6 +2822,7 @@ def _pull_critical(parsed: dict) -> dict:
     totals = _find_totals(parsed) or {}
     return {
         "invoice_number": _first(parsed, _INVOICE_NUMBER_KEYS_FOR_VOTE),
+        "invoice_date": _first(parsed, _INVOICE_DATE_KEYS),
         "subtotal": _num(totals.get("subtotal")),
         "tax": _num(_first(totals, _TAX_KEYS)),
         "total": _num(_first(totals, _TOTAL_KEYS)),
@@ -2806,6 +2839,11 @@ def _push_critical(parsed: dict, voted: dict) -> None:
         for k in _INVOICE_NUMBER_KEYS_FOR_VOTE:
             if k in parsed:
                 parsed[k] = voted["invoice_number"]
+                break
+    if voted.get("invoice_date") is not None:
+        for k in _INVOICE_DATE_KEYS:
+            if k in parsed:
+                parsed[k] = voted["invoice_date"]
                 break
     totals = _find_totals(parsed)
     if isinstance(totals, dict):
