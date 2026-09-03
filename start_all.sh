@@ -18,13 +18,15 @@ else
     --served-model-name qwen3.6-35b \
     --host 127.0.0.1 --port 7777 \
     --dtype float16 \
-    --max-model-len 65536 \
+    --max-model-len 32768 \
     --gpu-memory-utilization 0.85 \
     --max-num-seqs 8 \
+    --max-num-batched-tokens 4096 \
     --trust-remote-code \
     --enable-prefix-caching \
     --enable-auto-tool-choice \
     --tool-call-parser qwen3_coder \
+    --reasoning-parser qwen3 \
     --kv-cache-dtype fp8_e4m3 \
     --calculate-kv-scales \
     >> "$LOGS/vllm.log" 2>&1 &

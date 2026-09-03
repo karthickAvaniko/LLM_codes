@@ -998,8 +998,11 @@ def _wants_json(question: str) -> bool:
 _VLLM_TOTAL_SLOTS = 7   # vLLM launched with --max-num-seqs 8 (start_all.sh);
                         # keep 1 slot of headroom outside this accounting for
                         # calls that bypass the scheduler (e.g. /health).
-_VLLM_RESERVED = {"CHAT": 2, "AGENT": 1, "DOCUMENT": 0}   # always-available
-                                                           # minimum per class
+_VLLM_RESERVED = {"CHAT": 3, "AGENT": 1, "DOCUMENT": 3}   # always-available
+                                                           # minimum per class;
+                                                           # CHAT/DOCUMENT split
+                                                           # equal, AGENT keeps
+                                                           # 1 dedicated slot
 assert sum(_VLLM_RESERVED.values()) <= _VLLM_TOTAL_SLOTS
 
 class _VLLMScheduler:
@@ -3418,6 +3421,11 @@ async def chat_completions(request: Request):
         body.setdefault("chat_template_kwargs", {"enable_thinking": False})
         if body.get("max_tokens") is None or body["max_tokens"] > MAX_TOKENS_CAP:
             body["max_tokens"] = MAX_TOKENS_CAP
+        # still merge stray/duplicate system messages to one at position 0 —
+        # Qwen's template rejects anything else — without touching ordering
+        # or content of the tool-call/tool-result turns themselves.
+        if isinstance(body.get("messages"), list):
+            body["messages"] = _merge_system(body["messages"])
         log.info("CHAT | agent passthrough (tools present)")
     else:
         task = str(body.pop("task", "auto")).lower()
