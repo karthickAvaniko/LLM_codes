@@ -4,6 +4,7 @@
 .env.local
 .env.production
 .s3_env
+.passwd-s3fs
 .mysql_env
 .api_key
 *_KEY*.txt

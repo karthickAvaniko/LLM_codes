@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import secrets
+import threading
 import time
 import uuid
 from collections import Counter, defaultdict, deque
@@ -540,23 +541,45 @@ async def require_api_key(request: Request, call_next):
                                "ms": int((time.time() - start) * 1000), "auth": user})
     return response
 
-# ── OCR via isolated microservice (127.0.0.1:7780) ───────
-# PaddleOCR runs in its OWN process with auto-restart. A Paddle crash never
-# touches the gateway; a hang is bounded by the request timeout.
-OCR_URL = "http://127.0.0.1:7780"
+# ── OCR via isolated microservice pool (127.0.0.1:7780-7783) ─
+# PaddleOCR runs in 4 independent processes with auto-restart. A Paddle
+# crash never touches the gateway; a hang is bounded by the request
+# timeout. Requests round-robin across the pool with automatic fallback
+# to the next instance on failure, so one dead/slow worker doesn't stall
+# a request — it just costs one extra hop.
+OCR_URLS = [
+    "http://127.0.0.1:7780",
+    "http://127.0.0.1:7781",
+    "http://127.0.0.1:7782",
+    "http://127.0.0.1:7783",
+]
+_ocr_rr_lock = threading.Lock()
+_ocr_rr_next = 0
+
+def _ocr_rr_start_index() -> int:
+    global _ocr_rr_next
+    with _ocr_rr_lock:
+        i = _ocr_rr_next % len(OCR_URLS)
+        _ocr_rr_next += 1
+    return i
 
 def ocr_image(img_bytes: bytes, label: str = "") -> str:
-    """Blocking call to the OCR service. Returns "" on any failure so the
-    document pipeline degrades gracefully instead of erroring."""
-    try:
-        r = httpx.post(f"{OCR_URL}/ocr", content=img_bytes, timeout=120)
-        if r.status_code == 200:
-            text = r.json().get("text", "")
-            log.info(f"OCR | {label} | {len(text)} chars")
-            return text
-        log.error(f"OCR service {r.status_code} | {label}")
-    except Exception as e:
-        log.error(f"OCR service unreachable | {label} | {e}")
+    """Blocking call to the OCR service pool. Round-robins across workers,
+    falling back to the next healthy one on failure. Returns "" only if
+    every instance fails, so the document pipeline degrades gracefully
+    instead of erroring."""
+    start = _ocr_rr_start_index()
+    for attempt in range(len(OCR_URLS)):
+        url = OCR_URLS[(start + attempt) % len(OCR_URLS)]
+        try:
+            r = httpx.post(f"{url}/ocr", content=img_bytes, timeout=120)
+            if r.status_code == 200:
+                text = r.json().get("text", "")
+                log.info(f"OCR | {label} | {url} | {len(text)} chars")
+                return text
+            log.error(f"OCR service {r.status_code} | {label} | {url}")
+        except Exception as e:
+            log.error(f"OCR service unreachable | {label} | {url} | {e}")
     return ""
 
 def extract_pages(content: bytes, filename: str) -> list[str]:
