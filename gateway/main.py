@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import secrets
+import subprocess
 import threading
 import time
 import uuid
@@ -1892,6 +1893,161 @@ async def health():
         except Exception:
             vllm_ok = False
     return {"gateway": "ok", "vllm": "ok" if vllm_ok else "down", "model": PUBLIC_MODEL}
+
+# ── System dashboard (admin console "System" tab) — added 2026-09-18 ───────
+def _gpu_stats_sync() -> dict | None:
+    """One nvidia-smi call, CSV-parsed — no pynvml dependency needed for a
+    handful of numbers refreshed every few seconds."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi",
+             "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5)
+        if out.returncode != 0:
+            return None
+        name, util, mem_used, mem_total, temp, power = [p.strip() for p in out.stdout.strip().split(",")]
+        return {"name": name, "utilization_pct": float(util), "mem_used_mb": float(mem_used),
+                "mem_total_mb": float(mem_total), "temp_c": float(temp), "power_w": float(power)}
+    except Exception:
+        return None
+
+_VLLM_METRIC_RE_CACHE: dict[str, re.Pattern] = {}
+def _vllm_metric(text: str, name: str) -> float | None:
+    """Pulls the first sample of a vllm: Prometheus metric out of the raw
+    /metrics text (single-engine deployment, so 'first match' is fine) --
+    a tiny regex scan instead of pulling in a full prometheus_client parser
+    dependency for a handful of gauges."""
+    pat = _VLLM_METRIC_RE_CACHE.get(name)
+    if pat is None:
+        pat = _VLLM_METRIC_RE_CACHE[name] = re.compile(
+            re.escape(name) + r"\{[^}]*\}\s+([0-9.eE+-]+)")
+    m = pat.search(text)
+    return float(m.group(1)) if m else None
+
+def _vllm_metric_by_label(text: str, name: str, label: str, value: str) -> float | None:
+    """Same as _vllm_metric() but for a metric with multiple label-distinguished
+    samples (e.g. request_success_total{...,finished_reason="stop"} vs
+    {...,finished_reason="length"})."""
+    pat = re.compile(re.escape(name) + r"\{[^}]*" + re.escape(f'{label}="{value}"')
+                      + r"[^}]*\}\s+([0-9.eE+-]+)")
+    m = pat.search(text)
+    return float(m.group(1)) if m else None
+
+async def _vllm_metrics() -> dict | None:
+    try:
+        async with httpx.AsyncClient(timeout=5) as c:
+            r = await c.get(f"{VLLM_URL}/metrics")
+        if r.status_code != 200:
+            return None
+        t = r.text
+        prefix_q = _vllm_metric(t, "vllm:prefix_cache_queries_total") or 0
+        prefix_h = _vllm_metric(t, "vllm:prefix_cache_hits_total") or 0
+        mm_q = _vllm_metric(t, "vllm:mm_cache_queries_total") or 0
+        mm_h = _vllm_metric(t, "vllm:mm_cache_hits_total") or 0
+        ttft_n = _vllm_metric(t, "vllm:time_to_first_token_seconds_count") or 0
+        ttft_s = _vllm_metric(t, "vllm:time_to_first_token_seconds_sum") or 0
+        e2e_n = _vllm_metric(t, "vllm:e2e_request_latency_seconds_count") or 0
+        e2e_s = _vllm_metric(t, "vllm:e2e_request_latency_seconds_sum") or 0
+        return {
+            "running": _vllm_metric(t, "vllm:num_requests_running"),
+            "waiting": _vllm_metric(t, "vllm:num_requests_waiting"),
+            "kv_cache_usage_pct": (_vllm_metric(t, "vllm:kv_cache_usage_perc") or 0) * 100,
+            "prefix_cache_hit_pct": (prefix_h / prefix_q * 100) if prefix_q else 0,
+            "mm_cache_hit_pct": (mm_h / mm_q * 100) if mm_q else 0,
+            "prompt_tokens_total": _vllm_metric(t, "vllm:prompt_tokens_total"),
+            "generation_tokens_total": _vllm_metric(t, "vllm:generation_tokens_total"),
+            "avg_ttft_ms": (ttft_s / ttft_n * 1000) if ttft_n else None,
+            "avg_e2e_latency_ms": (e2e_s / e2e_n * 1000) if e2e_n else None,
+            "requests_by_reason": {
+                reason: (_vllm_metric_by_label(t, "vllm:request_success_total", "finished_reason", reason) or 0)
+                for reason in ("stop", "length", "abort", "error", "repetition")
+            },
+        }
+    except Exception:
+        return None
+
+async def _service_up(url: str, timeout: float = 3) -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as c:
+            r = await c.get(f"{url}/health")
+        return r.status_code == 200
+    except Exception:
+        return False
+
+def _mysql_up_sync() -> bool:
+    try:
+        with _db() as conn, conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        return True
+    except Exception:
+        return False
+
+def _tail_jsonl_sync(path: Path, n: int) -> list[dict]:
+    if not path.exists():
+        return []
+    try:
+        with path.open("rb") as f:
+            f.seek(0, io.SEEK_END)
+            size = f.tell()
+            block = 65536
+            data = b""
+            while size > 0 and data.count(b"\n") <= n:
+                step = min(block, size)
+                size -= step
+                f.seek(size)
+                data = f.read(step) + data
+        lines = data.splitlines()[-n:]
+    except Exception:
+        return []
+    out = []
+    for l in lines:
+        try:
+            out.append(json.loads(l))
+        except Exception:
+            pass
+    out.reverse()  # newest first
+    return out
+
+@app.get("/admin-api/system")
+async def admin_system():
+    loop = asyncio.get_event_loop()
+    gpu_task    = loop.run_in_executor(None, _gpu_stats_sync)
+    mysql_task  = loop.run_in_executor(None, _mysql_up_sync)
+    tail_task   = loop.run_in_executor(None, _tail_jsonl_sync, ACCESS_LOG, 60)
+    vllm_task   = _vllm_metrics()
+    ocr_tasks   = [_service_up(u) for u in OCR_URLS]
+    embed_task  = _service_up(EMBED_URL)
+    gpu, mysql_up, recent, vllm_metrics, ocr_ups, embed_up = await asyncio.gather(
+        gpu_task, mysql_task, tail_task, vllm_task,
+        asyncio.gather(*ocr_tasks), embed_task)
+
+    total_key_inflight = sum(_key_inflight.values())
+    top_keys = sorted(
+        ({"name": API_KEYS.get(h, {}).get("name", "?"), "in_flight": n}
+         for h, n in _key_inflight.items() if n > 0),
+        key=lambda x: -x["in_flight"])[:10]
+
+    return {
+        "gpu": gpu,
+        "vllm": vllm_metrics,
+        "vllm_up": vllm_metrics is not None,
+        "scheduler": {
+            "total_slots": _VLLM_TOTAL_SLOTS,
+            "classes": [{"name": c, "in_flight": _vllm_sched._in_flight.get(c, 0),
+                         "reserved": _VLLM_RESERVED.get(c, 0)} for c in _VLLM_RESERVED],
+        },
+        "key_concurrency": {"limit": KEY_CONCURRENCY_LIMIT, "total_in_flight": total_key_inflight,
+                             "top_keys": top_keys},
+        "ip_extract_concurrency": {"limit": IP_EXTRACT_CONCURRENCY_LIMIT,
+                                    "total_in_flight": sum(_ip_extract_inflight.values())},
+        "idle_seconds": round(time.time() - _last_request_ts, 1),
+        "services": {
+            "gateway": True, "mysql": mysql_up, "embed": embed_up,
+            "ocr": [{"url": u, "up": up} for u, up in zip(OCR_URLS, ocr_ups)],
+        },
+        "recent_requests": recent,
+    }
 
 # ── Admin: API key management (master key required) ───────
 def _find_by_id(key_id: str) -> tuple[str, dict] | tuple[None, None]:

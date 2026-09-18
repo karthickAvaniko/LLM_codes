@@ -179,6 +179,31 @@ td code{font-family:'Fira Code',ui-monospace,monospace;font-size:.77rem;color:va
 pre{background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:15px;overflow-x:auto;
   font-size:.77rem;line-height:1.6;margin-top:12px;font-family:'Fira Code',monospace;color:var(--text2)}
 
+/* ============ SYSTEM DASHBOARD ============ */
+.barwrap{background:var(--bg2);border:1px solid var(--border);border-radius:999px;height:10px;overflow:hidden;position:relative}
+.bar-fill{height:100%;border-radius:999px;background:linear-gradient(90deg,var(--accent),var(--accent2));transition:width .4s ease}
+.bar-fill.warn{background:linear-gradient(90deg,#f59e0b,#d97706)}
+.bar-fill.crit{background:linear-gradient(90deg,#f43f5e,#be123c)}
+.qrow{display:flex;flex-direction:column;gap:6px;padding:12px 0;border-bottom:1px solid var(--border)}
+.qrow:last-child{border-bottom:none}
+.qrow-h{display:flex;justify-content:space-between;font-size:.82rem;font-weight:600}
+.qrow-h span.n{color:var(--muted);font-weight:500;font-size:.76rem}
+.svc-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}
+.svc-pill{display:flex;align-items:center;gap:9px;background:var(--surface2);border:1px solid var(--border);
+  border-radius:var(--radius-sm);padding:11px 13px;font-size:.82rem;font-weight:600}
+.svc-dot{width:9px;height:9px;border-radius:50%;flex-shrink:0}
+.svc-dot.on{background:var(--green);box-shadow:0 0 8px var(--green)}
+.svc-dot.off{background:var(--red);box-shadow:0 0 8px var(--red)}
+.spark{display:block;width:100%;height:36px;margin-top:8px}
+.gauge-row{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:4px}
+.gauge-row .gv{font-size:.76rem;color:var(--muted)}
+.livedot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--green);margin-right:6px;
+  animation:pulse 1.6s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+.reqrow-slow{color:var(--amber) !important}
+.reqrow-err{color:var(--red) !important}
+.mono{font-family:'Fira Code',ui-monospace,monospace;font-size:.78rem}
+
 .toast{position:fixed;bottom:28px;left:50%;transform:translateX(-50%) translateY(10px);background:var(--surface);
   border:1px solid var(--accent);border-radius:12px;padding:12px 22px;font-size:.85rem;font-weight:500;opacity:0;
   transition:.3s;pointer-events:none;box-shadow:var(--shadow);z-index:99}
@@ -221,6 +246,8 @@ pre{background:var(--bg2);border:1px solid var(--border);border-radius:var(--rad
         <svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.2"/><path d="M3.5 20a5.5 5.5 0 0 1 11 0"/><path d="M16 5.2a3 3 0 0 1 0 5.6"/><path d="M18 14.5a5 5 0 0 1 3 4.5"/></svg>Users</div>
       <div class="navitem adminonly" data-tab="keys" onclick="go('keys')">
         <svg viewBox="0 0 24 24"><circle cx="8" cy="15" r="4"/><path d="M11 13l8-8"/><path d="M16 5l3 3"/><path d="M19 8l2-2"/></svg>API Keys</div>
+      <div class="navitem adminonly" data-tab="system" onclick="go('system')">
+        <svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/><path d="M6 8h4M6 11h7"/></svg>System</div>
       <div class="navitem" data-tab="test" onclick="go('test')">
         <svg viewBox="0 0 24 24"><polygon points="6 4 20 12 6 20 6 4"/></svg>Test API Key</div>
     </nav>
@@ -309,7 +336,67 @@ pre{background:var(--bg2);border:1px solid var(--border);border-radius:var(--rad
         </div>
       </section>
 
-      <!-- 4. TEST -->
+      <!-- 4. SYSTEM -->
+      <section class="page" id="page-system">
+        <div class="stats" id="sys-stats"></div>
+
+        <div class="card">
+          <div class="card-h"><div><h3>GPU</h3><div class="sub" id="sys-gpu-name">—</div></div>
+            <span style="font-size:.78rem;color:var(--muted)"><span class="livedot"></span>Live · refreshes every 4s</span></div>
+          <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(220px,1fr))">
+            <div>
+              <div class="gauge-row"><span class="lbl" style="margin:0">Utilization</span><span class="gv" id="sys-gpu-util-v">—</span></div>
+              <div class="barwrap"><div class="bar-fill" id="sys-gpu-util-bar" style="width:0%"></div></div>
+              <svg class="spark" id="sys-gpu-util-spark"></svg>
+            </div>
+            <div>
+              <div class="gauge-row"><span class="lbl" style="margin:0">VRAM</span><span class="gv" id="sys-gpu-mem-v">—</span></div>
+              <div class="barwrap"><div class="bar-fill" id="sys-gpu-mem-bar" style="width:0%"></div></div>
+            </div>
+            <div>
+              <div class="gauge-row"><span class="lbl" style="margin:0">Temp / Power</span><span class="gv" id="sys-gpu-temp-v">—</span></div>
+              <div class="barwrap"><div class="bar-fill" id="sys-gpu-temp-bar" style="width:0%"></div></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-h"><div><h3>vLLM engine</h3><div class="sub">Scheduler admission per queue class — reserved slots out of the total pool.</div></div></div>
+          <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(220px,1fr));margin-bottom:18px">
+            <div>
+              <div class="gauge-row"><span class="lbl" style="margin:0">Running / Waiting</span><span class="gv" id="sys-vllm-rw">—</span></div>
+            </div>
+            <div>
+              <div class="gauge-row"><span class="lbl" style="margin:0">KV cache usage</span><span class="gv" id="sys-kv-v">—</span></div>
+              <div class="barwrap"><div class="bar-fill" id="sys-kv-bar" style="width:0%"></div></div>
+            </div>
+            <div>
+              <div class="gauge-row"><span class="lbl" style="margin:0">Prefix cache hit rate</span><span class="gv" id="sys-prefix-v">—</span></div>
+              <div class="barwrap"><div class="bar-fill" id="sys-prefix-bar" style="width:0%"></div></div>
+            </div>
+          </div>
+          <div id="sys-queues"></div>
+        </div>
+
+        <div class="grid" style="grid-template-columns:1fr 1fr;align-items:stretch">
+          <div class="card">
+            <div class="card-h"><div><h3>Per-key concurrency</h3><div class="sub">Live in-flight requests per API key (cap: <span id="sys-key-limit">—</span>).</div></div></div>
+            <div id="sys-key-inflight"><div class="empty">No keys currently in flight.</div></div>
+          </div>
+          <div class="card">
+            <div class="card-h"><div><h3>Services</h3><div class="sub">Every process this gateway depends on.</div></div></div>
+            <div class="svc-grid" id="sys-services"></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-h"><div><h3>Live requests</h3><div class="sub">Last 60 requests across every user — newest first.</div></div>
+            <button class="btn ghost" onclick="loadSystem()">↻ Refresh now</button></div>
+          <div class="tablewrap" style="max-height:520px;overflow-y:auto"><table id="sys-requests"></table></div>
+        </div>
+      </section>
+
+      <!-- 5. TEST -->
       <section class="page" id="page-test">
         <div class="card">
           <div class="card-h"><div><h3>Test an API key</h3><div class="sub">Paste a key and send a real request to confirm it works.</div></div></div>
@@ -379,7 +466,9 @@ print(r.choices[0].message.content)`;
   go('dashboard');loadAll();
 }
 const META={dashboard:['Dashboard','Overview of your account'],users:['Users','Create and manage accounts'],
-  keys:['API Keys','Generate and manage keys'],test:['Test API Key','Verify a key works live']};
+  keys:['API Keys','Generate and manage keys'],system:['System','Live GPU, engine and request monitoring'],
+  test:['Test API Key','Verify a key works live']};
+let SYS_TIMER=null;
 function go(tab){
   document.querySelectorAll('.navitem').forEach(n=>n.classList.toggle('active',n.dataset.tab===tab));
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('show'));
@@ -387,6 +476,8 @@ function go(tab){
   document.getElementById('page-title').textContent=META[tab][0];
   document.getElementById('crumb').textContent=META[tab][1];
   document.getElementById('side').classList.remove('open');
+  if(SYS_TIMER){clearInterval(SYS_TIMER);SYS_TIMER=null;}
+  if(tab==='system'){loadSystem();SYS_TIMER=setInterval(loadSystem,4000);}
 }
 async function loadAll(){
   if(ROLE==='admin'){
@@ -536,6 +627,115 @@ async function runDemo(){
     if(r.ok)loadAll();
   }catch(e){out.textContent='Request failed: '+e;}finally{btn.disabled=false;}
 }
+// ---------- SYSTEM DASHBOARD ----------
+let SYS_HIST=[];        // rolling {t,util,running,promptTok,genTok} for sparkline + tok/s delta
+let SYS_PREV=null;
+function sevClass(pct){return pct>=90?'crit':pct>=70?'warn':'';}
+function fmtNum(n){return n==null?'—':Math.round(n).toLocaleString();}
+function fmtPct(n){return n==null?'—':n.toFixed(1)+'%';}
+function sparkline(el,vals,max){
+  if(!vals.length){el.innerHTML='';return;}
+  const w=el.clientWidth||200,h=36,m=max||Math.max(1,...vals);
+  const pts=vals.map((v,i)=>`${(i/(vals.length-1||1)*w).toFixed(1)},${(h-(v/m)*h).toFixed(1)}`).join(' ');
+  el.setAttribute('viewBox',`0 0 ${w} ${h}`);
+  const col=getComputedStyle(document.body).getPropertyValue('--accent').trim();
+  el.innerHTML=`<polyline points="${esc(pts)}" fill="none" stroke="${col}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+}
+function timeAgo(ts){
+  if(!ts)return '—';
+  const s=(Date.now()-new Date(ts).getTime())/1000;
+  if(s<60)return Math.floor(s)+'s ago';
+  if(s<3600)return Math.floor(s/60)+'m ago';
+  return Math.floor(s/3600)+'h ago';
+}
+async function loadSystem(){
+  let d;
+  try{d=await api('GET','/admin-api/system');}catch(e){return;}
+  if(!d||d.error)return;
+  const now=Date.now();
+  const gpu=d.gpu||{}, v=d.vllm||{};
+
+  // ---- headline stats, with a live tokens/sec derived from the delta since the last poll ----
+  let promptTps='—', genTps='—';
+  if(SYS_PREV && v.prompt_tokens_total!=null){
+    const dt=(now-SYS_PREV.t)/1000;
+    if(dt>0){
+      promptTps=Math.max(0,Math.round((v.prompt_tokens_total-SYS_PREV.promptTok)/dt));
+      genTps=Math.max(0,Math.round((v.generation_tokens_total-SYS_PREV.genTok)/dt));
+    }
+  }
+  SYS_PREV={t:now,promptTok:v.prompt_tokens_total||0,genTok:v.generation_tokens_total||0};
+  document.getElementById('sys-stats').innerHTML=stat([
+    ['Running', fmtNum(v.running)], ['Waiting', fmtNum(v.waiting)],
+    ['Prompt tok/s', promptTps], ['Gen tok/s', genTps],
+    ['Avg latency', v.avg_e2e_latency_ms!=null?Math.round(v.avg_e2e_latency_ms)+'ms':'—'],
+    ['Idle for', d.idle_seconds!=null?Math.round(d.idle_seconds)+'s':'—'],
+  ]);
+
+  // ---- GPU ----
+  document.getElementById('sys-gpu-name').textContent=gpu.name||'GPU stats unavailable (nvidia-smi failed)';
+  const util=gpu.utilization_pct??0;
+  document.getElementById('sys-gpu-util-v').textContent=fmtPct(gpu.utilization_pct);
+  const ub=document.getElementById('sys-gpu-util-bar'); ub.style.width=util+'%'; ub.className='bar-fill '+sevClass(util);
+  const memPct=gpu.mem_total_mb?gpu.mem_used_mb/gpu.mem_total_mb*100:0;
+  document.getElementById('sys-gpu-mem-v').textContent=gpu.mem_used_mb!=null?
+    `${(gpu.mem_used_mb/1024).toFixed(1)} / ${(gpu.mem_total_mb/1024).toFixed(1)} GB`:'—';
+  const mb=document.getElementById('sys-gpu-mem-bar'); mb.style.width=memPct+'%'; mb.className='bar-fill '+sevClass(memPct);
+  const tempPct=gpu.temp_c?Math.min(100,gpu.temp_c/90*100):0;
+  document.getElementById('sys-gpu-temp-v').textContent=gpu.temp_c!=null?`${gpu.temp_c}°C · ${Math.round(gpu.power_w||0)}W`:'—';
+  const tb=document.getElementById('sys-gpu-temp-bar'); tb.style.width=tempPct+'%'; tb.className='bar-fill '+sevClass(tempPct);
+
+  SYS_HIST.push(util); if(SYS_HIST.length>30)SYS_HIST.shift();
+  sparkline(document.getElementById('sys-gpu-util-spark'),SYS_HIST,100);
+
+  // ---- vLLM engine ----
+  document.getElementById('sys-vllm-rw').textContent=d.vllm_up?`${fmtNum(v.running)} / ${fmtNum(v.waiting)}`:'vLLM unreachable';
+  const kv=v.kv_cache_usage_pct||0;
+  document.getElementById('sys-kv-v').textContent=fmtPct(v.kv_cache_usage_pct);
+  const kb=document.getElementById('sys-kv-bar'); kb.style.width=kv+'%'; kb.className='bar-fill '+sevClass(kv);
+  const pfx=v.prefix_cache_hit_pct||0;
+  document.getElementById('sys-prefix-v').textContent=fmtPct(v.prefix_cache_hit_pct);
+  const pb=document.getElementById('sys-prefix-bar'); pb.style.width=pfx+'%';
+
+  // ---- per-class scheduler queues ----
+  const cls=(d.scheduler&&d.scheduler.classes)||[];
+  const total=(d.scheduler&&d.scheduler.total_slots)||1;
+  document.getElementById('sys-queues').innerHTML=cls.map(c=>{
+    const pct=c.in_flight/total*100;
+    return `<div class="qrow"><div class="qrow-h"><span>${esc(c.name)}</span>
+      <span class="n">${c.in_flight} running · ${c.reserved} reserved · ${total} total pool</span></div>
+      <div class="barwrap"><div class="bar-fill ${sevClass(c.in_flight/Math.max(1,c.reserved)*100)}" style="width:${Math.min(100,pct)}%"></div></div></div>`;
+  }).join('')||'<div class="empty">No queue data.</div>';
+
+  // ---- per-key concurrency ----
+  document.getElementById('sys-key-limit').textContent=(d.key_concurrency&&d.key_concurrency.limit)??'—';
+  const topKeys=(d.key_concurrency&&d.key_concurrency.top_keys)||[];
+  document.getElementById('sys-key-inflight').innerHTML=topKeys.length?
+    topKeys.map(k=>`<div class="qrow"><div class="qrow-h"><span>${esc(k.name)}</span>
+      <span class="n">${k.in_flight} / ${d.key_concurrency.limit} in flight</span></div>
+      <div class="barwrap"><div class="bar-fill ${sevClass(k.in_flight/d.key_concurrency.limit*100)}"
+        style="width:${Math.min(100,k.in_flight/d.key_concurrency.limit*100)}%"></div></div></div>`).join('')
+    :'<div class="empty">No keys currently in flight.</div>';
+
+  // ---- services ----
+  const svc=d.services||{};
+  const pills=[['Gateway',svc.gateway],['vLLM',d.vllm_up],['MySQL',svc.mysql],['Embeddings',svc.embed]];
+  (svc.ocr||[]).forEach((o,i)=>pills.push([`OCR ${i+1}`,o.up]));
+  document.getElementById('sys-services').innerHTML=pills.map(([name,up])=>
+    `<div class="svc-pill"><span class="svc-dot ${up?'on':'off'}"></span>${esc(name)}</div>`).join('');
+
+  // ---- live requests table ----
+  const rows=d.recent_requests||[];
+  const h=`<thead><tr><th>Time</th><th>Auth</th><th>Method</th><th>Path</th><th>Status</th><th>Latency</th><th>IP</th></tr></thead>`;
+  document.getElementById('sys-requests').innerHTML=h+'<tbody>'+(rows.length?rows.map(r=>{
+    const slow=r.ms>=5000, err=r.status>=400;
+    const cls=err?'reqrow-err':(slow?'reqrow-slow':'');
+    return `<tr><td class="mono">${esc(timeAgo(r.ts))}</td><td>${esc(r.auth)}</td><td class="mono">${esc(r.method)}</td>
+      <td class="mono">${esc(r.path)}</td><td class="${cls}">${r.status}</td><td class="${cls}">${r.ms}ms</td>
+      <td class="mono">${esc(r.ip)}</td></tr>`;
+  }).join(''):'<tr><td colspan="7"><div class="empty">No requests yet.</div></td></tr>')+'</tbody>';
+}
+
 function logout(){['av_session','av_role','av_name'].forEach(k=>localStorage.removeItem(k));location.reload();}
 if(TOKEN&&ROLE){
   const probe=ROLE==='admin'?'/admin-api/users':'/me/usage';
