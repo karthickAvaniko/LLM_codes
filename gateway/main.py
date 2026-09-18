@@ -433,6 +433,28 @@ async def _release_key_slot(key_hash: str):
         _key_inflight[key_hash] -= 1
         _key_concurrency_cond.notify_all()
 
+# ── Per-IP concurrency cap for /v1/extract — added 2026-09-18 ───────────────
+# /v1/extract is in PUBLIC_PATHS (no API key required), so KEY_CONCURRENCY_LIMIT
+# above never applies to it — confirmed the gap matters: one IP fired ~9
+# /v1/extract calls within 70s (7 failed outright while vLLM was mid-restart,
+# then several large vision-hybrid ones landed concurrently and each took
+# 11-47s, escalating) with nothing at the gateway throttling any of it. Same
+# pattern as the per-key cap, keyed by source IP since there's no key here.
+IP_EXTRACT_CONCURRENCY_LIMIT = 3
+_ip_extract_inflight = defaultdict(int)
+_ip_extract_cond = asyncio.Condition()
+
+async def _acquire_ip_extract_slot(ip: str):
+    async with _ip_extract_cond:
+        await _ip_extract_cond.wait_for(
+            lambda: _ip_extract_inflight[ip] < IP_EXTRACT_CONCURRENCY_LIMIT)
+        _ip_extract_inflight[ip] += 1
+
+async def _release_ip_extract_slot(ip: str):
+    async with _ip_extract_cond:
+        _ip_extract_inflight[ip] -= 1
+        _ip_extract_cond.notify_all()
+
 # ── vLLM keep-alive — added 2026-09-18 ──────────────────────────────────────
 # A request landing on a genuinely idle engine measured 6.3 tokens/s
 # generation (vs. the usual 40-100+ tok/s warm) -- a 30.5s wait for a
@@ -508,7 +530,14 @@ async def require_api_key(request: Request, call_next):
         _last_request_ts = time.time()
 
     if request.method == "OPTIONS" or request.url.path in PUBLIC_PATHS:
-        response = await call_next(request)
+        is_extract = request.method == "POST" and request.url.path == "/v1/extract"
+        if is_extract:
+            await _acquire_ip_extract_slot(ip)
+        try:
+            response = await call_next(request)
+        finally:
+            if is_extract:
+                await _release_ip_extract_slot(ip)
         _log_async(ACCESS_LOG, {"ip": ip, "method": request.method,
                                    "path": request.url.path, "status": response.status_code,
                                    "ms": int((time.time() - start) * 1000), "auth": "public"})
