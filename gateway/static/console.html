@@ -6,7 +6,7 @@
 <title>Avaniko AI — Console</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Sora:wght@500;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@500;600;700;800&family=Inter:wght@400;500;600;700&family=Orbitron:wght@600;700;800&family=Share+Tech+Mono&display=swap" rel="stylesheet">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -179,30 +179,145 @@ td code{font-family:'Fira Code',ui-monospace,monospace;font-size:.77rem;color:va
 pre{background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:15px;overflow-x:auto;
   font-size:.77rem;line-height:1.6;margin-top:12px;font-family:'Fira Code',monospace;color:var(--text2)}
 
-/* ============ SYSTEM DASHBOARD ============ */
-.barwrap{background:var(--bg2);border:1px solid var(--border);border-radius:999px;height:10px;overflow:hidden;position:relative}
-.bar-fill{height:100%;border-radius:999px;background:linear-gradient(90deg,var(--accent),var(--accent2));transition:width .4s ease}
-.bar-fill.warn{background:linear-gradient(90deg,#f59e0b,#d97706)}
-.bar-fill.crit{background:linear-gradient(90deg,#f43f5e,#be123c)}
-.qrow{display:flex;flex-direction:column;gap:6px;padding:12px 0;border-bottom:1px solid var(--border)}
-.qrow:last-child{border-bottom:none}
-.qrow-h{display:flex;justify-content:space-between;font-size:.82rem;font-weight:600}
-.qrow-h span.n{color:var(--muted);font-weight:500;font-size:.76rem}
-.svc-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}
-.svc-pill{display:flex;align-items:center;gap:9px;background:var(--surface2);border:1px solid var(--border);
-  border-radius:var(--radius-sm);padding:11px 13px;font-size:.82rem;font-weight:600}
-.svc-dot{width:9px;height:9px;border-radius:50%;flex-shrink:0}
-.svc-dot.on{background:var(--green);box-shadow:0 0 8px var(--green)}
-.svc-dot.off{background:var(--red);box-shadow:0 0 8px var(--red)}
-.spark{display:block;width:100%;height:36px;margin-top:8px}
-.gauge-row{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:4px}
-.gauge-row .gv{font-size:.76rem;color:var(--muted)}
-.livedot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--green);margin-right:6px;
-  animation:pulse 1.6s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
-.reqrow-slow{color:var(--amber) !important}
-.reqrow-err{color:var(--red) !important}
-.mono{font-family:'Fira Code',ui-monospace,monospace;font-size:.78rem}
+/* ============================================================
+   OPS CONSOLE — holographic HUD theme, scoped to #page-system.
+   Independent of the account light/dark toggle: an instrument panel
+   has one mode. Two accents carry real meaning (cyan = nominal/live,
+   amber = attention), not decoration — red/green are reserved purely
+   for hard up/down and error states.
+   ============================================================ */
+#page-system{
+  --void:#04070d; --deck:#070d16; --panel:#0a121e; --panel2:#0d1826;
+  --line:#16283a; --line-bright:#1f3c52;
+  --cyan:#5be8ff; --cyan-dim:#2a6472; --cyan-glow:rgba(91,232,255,.35);
+  --amber:#ffb238; --amber-glow:rgba(255,178,56,.35);
+  --ok:#3dffb0; --crit:#ff3b5c;
+  --ink:#d9f4ff; --ink-dim:#5c7d8c;
+  position:relative;background:var(--void);border-radius:20px;padding:22px 22px 26px;
+  color:var(--ink);overflow:hidden;isolation:isolate;
+  font-feature-settings:"tnum";
+}
+#page-system::before{ /* fine targeting grid */
+  content:"";position:absolute;inset:0;z-index:0;pointer-events:none;opacity:.5;
+  background-image:linear-gradient(var(--line) 1px,transparent 1px),linear-gradient(90deg,var(--line) 1px,transparent 1px);
+  background-size:28px 28px;mask-image:radial-gradient(ellipse 100% 70% at 50% 0%,#000 40%,transparent 88%);
+}
+#page-system::after{ /* vignette */
+  content:"";position:absolute;inset:0;z-index:0;pointer-events:none;
+  background:radial-gradient(ellipse 90% 60% at 50% -10%,rgba(91,232,255,.07),transparent 60%);
+}
+#page-system>*{position:relative;z-index:1}
+#page-system .hud-mono{font-family:'Share Tech Mono',ui-monospace,monospace}
+#page-system .hud-display{font-family:'Orbitron',sans-serif}
+
+/* ambient scan sweep */
+.hud-sweep{position:absolute;left:-20%;top:0;width:55%;height:100%;z-index:0;pointer-events:none;
+  background:linear-gradient(100deg,transparent,rgba(91,232,255,.05) 45%,rgba(91,232,255,.1) 50%,rgba(91,232,255,.05) 55%,transparent);
+  animation:sweep 9s linear infinite}
+@keyframes sweep{0%{transform:translateX(-40%)}100%{transform:translateX(260%)}}
+
+/* topbar */
+.hud-topbar{display:flex;align-items:center;gap:16px;flex-wrap:wrap;padding-bottom:16px;margin-bottom:18px;
+  border-bottom:1px solid var(--line-bright)}
+.hud-eyebrow{font-family:'Orbitron',sans-serif;font-size:.78rem;font-weight:700;letter-spacing:.14em;color:var(--cyan);
+  text-shadow:0 0 12px var(--cyan-glow)}
+.hud-status{display:flex;align-items:center;gap:8px;font-family:'Share Tech Mono',monospace;font-size:.78rem;
+  letter-spacing:.06em;padding:5px 12px;border:1px solid var(--cyan-dim);border-radius:99px;color:var(--cyan)}
+.hud-status.warn{color:var(--amber);border-color:var(--amber-glow)}
+.hud-status.crit{color:var(--crit);border-color:var(--crit)}
+.hud-status-dot{width:7px;height:7px;border-radius:50%;background:currentColor;box-shadow:0 0 8px currentColor;
+  animation:hpulse 1.8s ease-in-out infinite}
+.hud-clock{margin-left:auto;font-family:'Share Tech Mono',monospace;color:var(--ink-dim);font-size:.8rem;letter-spacing:.05em}
+@keyframes hpulse{0%,100%{opacity:1}50%{opacity:.3}}
+
+/* reactor gauge cluster — the signature element */
+.hud-reactor-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-bottom:18px}
+.hud-gauge{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:16px;
+  display:flex;flex-direction:column;align-items:center;gap:4px}
+.hud-gauge svg{width:112px;height:112px;transform:rotate(-90deg)}
+.hud-gauge-track{fill:none;stroke:var(--line);stroke-width:8}
+.hud-gauge-fill{fill:none;stroke:var(--cyan);stroke-width:8;stroke-linecap:round;
+  stroke-dasharray:326.7;stroke-dashoffset:326.7;filter:drop-shadow(0 0 6px var(--cyan-glow));
+  transition:stroke-dashoffset .6s cubic-bezier(.4,0,.2,1),stroke .3s}
+.hud-gauge-fill.warn{stroke:var(--amber);filter:drop-shadow(0 0 6px var(--amber-glow))}
+.hud-gauge-fill.crit{stroke:var(--crit);filter:drop-shadow(0 0 6px rgba(255,59,92,.45))}
+.hud-gauge-wrap{position:relative;width:112px;height:112px}
+.hud-gauge-mid{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center}
+.hud-gauge-mid b{font-family:'Orbitron',sans-serif;font-size:1.28rem;color:var(--ink);text-shadow:0 0 10px var(--cyan-glow)}
+.hud-gauge-mid span{font-family:'Share Tech Mono',monospace;font-size:.6rem;color:var(--ink-dim);letter-spacing:.08em}
+.hud-gauge-label{font-family:'Share Tech Mono',monospace;font-size:.68rem;letter-spacing:.1em;color:var(--ink-dim);margin-top:2px}
+.hud-tele{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:16px;display:flex;flex-direction:column;gap:9px}
+.hud-tele-h{font-family:'Orbitron',sans-serif;font-size:.68rem;font-weight:700;letter-spacing:.12em;color:var(--cyan-dim);margin-bottom:2px}
+.hud-tele-row{display:flex;justify-content:space-between;gap:10px;font-family:'Share Tech Mono',monospace;font-size:.74rem;color:var(--ink-dim)}
+.hud-tele-row b{color:var(--ink);font-weight:600}
+
+/* panels */
+.hud-grid2{display:grid;grid-template-columns:1.15fr 1fr;gap:14px;margin-bottom:14px}
+@media(max-width:900px){.hud-grid2{grid-template-columns:1fr}}
+.hud-panel{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:18px}
+.hud-panel-h{display:flex;align-items:center;justify-content:space-between;font-family:'Orbitron',sans-serif;
+  font-size:.72rem;font-weight:700;letter-spacing:.12em;color:var(--cyan-dim);margin-bottom:14px}
+.hud-panel-h b{color:var(--cyan)}
+.hud-btn{background:none;border:1px solid var(--cyan-dim);color:var(--cyan);border-radius:8px;padding:5px 11px;
+  font-family:'Share Tech Mono',monospace;font-size:.7rem;letter-spacing:.08em;cursor:pointer;transition:.15s}
+.hud-btn:hover{border-color:var(--cyan);box-shadow:0 0 10px var(--cyan-glow)}
+
+/* active operators — target-lock cards */
+.hud-ops-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:10px}
+.hud-op{position:relative;background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:12px 13px;
+  overflow:hidden;transition:.2s}
+.hud-op.live{border-color:var(--cyan-dim);box-shadow:0 0 0 1px var(--cyan-dim) inset}
+.hud-op.live::before{content:"";position:absolute;inset:0;border-radius:12px;border:1px solid var(--cyan);
+  opacity:.6;animation:targetpulse 1.6s ease-out infinite}
+@keyframes targetpulse{0%{opacity:.7;box-shadow:0 0 0 0 var(--cyan-glow)}100%{opacity:0;box-shadow:0 0 0 6px transparent}}
+.hud-op-h{display:flex;align-items:center;gap:7px;font-family:'Orbitron',sans-serif;font-size:.78rem;font-weight:700;
+  color:var(--ink);text-transform:uppercase}
+.hud-op-dot{width:7px;height:7px;border-radius:50%;background:var(--ink-dim);flex-shrink:0}
+.hud-op.live .hud-op-dot{background:var(--cyan);box-shadow:0 0 7px var(--cyan)}
+.hud-op-ep{font-family:'Share Tech Mono',monospace;font-size:.7rem;color:var(--ink-dim);margin-top:6px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hud-op-meta{display:flex;justify-content:space-between;margin-top:8px;font-family:'Share Tech Mono',monospace;
+  font-size:.66rem;color:var(--cyan-dim)}
+
+/* queue allocation bars */
+.hud-q{margin-bottom:12px}
+.hud-q:last-child{margin-bottom:0}
+.hud-q-h{display:flex;justify-content:space-between;font-family:'Share Tech Mono',monospace;font-size:.72rem;
+  color:var(--ink-dim);margin-bottom:5px;letter-spacing:.04em}
+.hud-q-h b{color:var(--ink);font-weight:600}
+.hud-q-track{height:8px;border-radius:3px;background:var(--void);border:1px solid var(--line);overflow:hidden;
+  display:flex;gap:2px;padding:1px}
+.hud-q-seg{flex:1;background:var(--line);border-radius:1px;transition:background .3s}
+.hud-q-seg.fill{background:var(--cyan);box-shadow:0 0 5px var(--cyan-glow)}
+.hud-q-seg.fill.warn{background:var(--amber);box-shadow:0 0 5px var(--amber-glow)}
+.hud-q-seg.fill.crit{background:var(--crit)}
+
+/* service links */
+.hud-svc-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px}
+.hud-svc{display:flex;align-items:center;gap:8px;background:var(--panel2);border:1px solid var(--line);
+  border-radius:9px;padding:9px 11px;font-family:'Share Tech Mono',monospace;font-size:.72rem;color:var(--ink-dim)}
+.hud-svc-led{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.hud-svc-led.on{background:var(--ok);box-shadow:0 0 7px var(--ok)}
+.hud-svc-led.off{background:var(--crit);box-shadow:0 0 7px var(--crit);animation:hpulse 1s infinite}
+
+/* live feed terminal */
+.hud-feed{max-height:360px;overflow-y:auto;font-family:'Share Tech Mono',monospace;font-size:.76rem;
+  display:flex;flex-direction:column-reverse;gap:0}
+.hud-feed::-webkit-scrollbar{width:6px}.hud-feed::-webkit-scrollbar-thumb{background:var(--line-bright)}
+.hud-feed-row{display:flex;gap:10px;padding:6px 4px;border-bottom:1px solid var(--line);color:var(--ink-dim);
+  animation:feedin .3s ease}
+@keyframes feedin{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
+.hud-feed-row .t{color:var(--cyan-dim);flex-shrink:0}
+.hud-feed-row .who{color:var(--cyan);flex-shrink:0;min-width:78px}
+.hud-feed-row .ep{color:var(--ink);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hud-feed-row .st{flex-shrink:0}
+.hud-feed-row.slow .st{color:var(--amber)}
+.hud-feed-row.err .st{color:var(--crit)}
+.hud-empty{color:var(--ink-dim);font-family:'Share Tech Mono',monospace;font-size:.78rem;text-align:center;padding:20px}
+
+@media(prefers-reduced-motion:reduce){
+  .hud-sweep,.hud-status-dot,.hud-op.live::before,.hud-svc-led.off{animation:none}
+}
 
 .toast{position:fixed;bottom:28px;left:50%;transform:translateX(-50%) translateY(10px);background:var(--surface);
   border:1px solid var(--accent);border-radius:12px;padding:12px 22px;font-size:.85rem;font-weight:500;opacity:0;
@@ -336,63 +451,64 @@ pre{background:var(--bg2);border:1px solid var(--border);border-radius:var(--rad
         </div>
       </section>
 
-      <!-- 4. SYSTEM -->
+      <!-- 4. SYSTEM (OPS CONSOLE / HUD) -->
       <section class="page" id="page-system">
-        <div class="stats" id="sys-stats"></div>
+        <div class="hud-sweep"></div>
 
-        <div class="card">
-          <div class="card-h"><div><h3>GPU</h3><div class="sub" id="sys-gpu-name">—</div></div>
-            <span style="font-size:.78rem;color:var(--muted)"><span class="livedot"></span>Live · refreshes every 4s</span></div>
-          <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(220px,1fr))">
-            <div>
-              <div class="gauge-row"><span class="lbl" style="margin:0">Utilization</span><span class="gv" id="sys-gpu-util-v">—</span></div>
-              <div class="barwrap"><div class="bar-fill" id="sys-gpu-util-bar" style="width:0%"></div></div>
-              <svg class="spark" id="sys-gpu-util-spark"></svg>
-            </div>
-            <div>
-              <div class="gauge-row"><span class="lbl" style="margin:0">VRAM</span><span class="gv" id="sys-gpu-mem-v">—</span></div>
-              <div class="barwrap"><div class="bar-fill" id="sys-gpu-mem-bar" style="width:0%"></div></div>
-            </div>
-            <div>
-              <div class="gauge-row"><span class="lbl" style="margin:0">Temp / Power</span><span class="gv" id="sys-gpu-temp-v">—</span></div>
-              <div class="barwrap"><div class="bar-fill" id="sys-gpu-temp-bar" style="width:0%"></div></div>
-            </div>
+        <div class="hud-topbar">
+          <div class="hud-eyebrow">AVANIKO // GPU OPS CONSOLE</div>
+          <div class="hud-status" id="hud-status"><span class="hud-status-dot"></span><span id="hud-status-text">SCANNING</span></div>
+          <div class="hud-clock hud-mono" id="hud-clock">—</div>
+        </div>
+
+        <div class="hud-reactor-row">
+          <div class="hud-gauge">
+            <div class="hud-gauge-wrap"><svg viewBox="0 0 120 120"><circle class="hud-gauge-track" cx="60" cy="60" r="52"/><circle class="hud-gauge-fill" id="hg-util" cx="60" cy="60" r="52"/></svg>
+              <div class="hud-gauge-mid"><b id="hgv-util">—</b><span>LOAD</span></div></div>
+            <div class="hud-gauge-label">GPU UTILIZATION</div>
+          </div>
+          <div class="hud-gauge">
+            <div class="hud-gauge-wrap"><svg viewBox="0 0 120 120"><circle class="hud-gauge-track" cx="60" cy="60" r="52"/><circle class="hud-gauge-fill" id="hg-vram" cx="60" cy="60" r="52"/></svg>
+              <div class="hud-gauge-mid"><b id="hgv-vram">—</b><span>VRAM</span></div></div>
+            <div class="hud-gauge-label" id="hgl-vram">MEMORY</div>
+          </div>
+          <div class="hud-gauge">
+            <div class="hud-gauge-wrap"><svg viewBox="0 0 120 120"><circle class="hud-gauge-track" cx="60" cy="60" r="52"/><circle class="hud-gauge-fill" id="hg-kv" cx="60" cy="60" r="52"/></svg>
+              <div class="hud-gauge-mid"><b id="hgv-kv">—</b><span>KV</span></div></div>
+            <div class="hud-gauge-label">KV CACHE POOL</div>
+          </div>
+          <div class="hud-gauge">
+            <div class="hud-gauge-wrap"><svg viewBox="0 0 120 120"><circle class="hud-gauge-track" cx="60" cy="60" r="52"/><circle class="hud-gauge-fill" id="hg-prefix" cx="60" cy="60" r="52"/></svg>
+              <div class="hud-gauge-mid"><b id="hgv-prefix">—</b><span>HIT</span></div></div>
+            <div class="hud-gauge-label">PREFIX CACHE</div>
+          </div>
+          <div class="hud-tele">
+            <div class="hud-tele-h">TELEMETRY</div>
+            <div class="hud-tele-row"><span>Running / Waiting</span><b id="ht-rw">—</b></div>
+            <div class="hud-tele-row"><span>Prompt tok/s</span><b id="ht-ptps">—</b></div>
+            <div class="hud-tele-row"><span>Gen tok/s</span><b id="ht-gtps">—</b></div>
+            <div class="hud-tele-row"><span>Avg latency</span><b id="ht-lat">—</b></div>
+            <div class="hud-tele-row"><span>Temp / Power</span><b id="ht-temp">—</b></div>
+            <div class="hud-tele-row"><span>Idle for</span><b id="ht-idle">—</b></div>
           </div>
         </div>
 
-        <div class="card">
-          <div class="card-h"><div><h3>vLLM engine</h3><div class="sub">Scheduler admission per queue class — reserved slots out of the total pool.</div></div></div>
-          <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(220px,1fr));margin-bottom:18px">
-            <div>
-              <div class="gauge-row"><span class="lbl" style="margin:0">Running / Waiting</span><span class="gv" id="sys-vllm-rw">—</span></div>
-            </div>
-            <div>
-              <div class="gauge-row"><span class="lbl" style="margin:0">KV cache usage</span><span class="gv" id="sys-kv-v">—</span></div>
-              <div class="barwrap"><div class="bar-fill" id="sys-kv-bar" style="width:0%"></div></div>
-            </div>
-            <div>
-              <div class="gauge-row"><span class="lbl" style="margin:0">Prefix cache hit rate</span><span class="gv" id="sys-prefix-v">—</span></div>
-              <div class="barwrap"><div class="bar-fill" id="sys-prefix-bar" style="width:0%"></div></div>
-            </div>
+        <div class="hud-grid2">
+          <div class="hud-panel">
+            <div class="hud-panel-h">ACTIVE OPERATORS <b id="hud-ops-count" class="hud-mono">0</b></div>
+            <div id="hud-operators" class="hud-ops-grid"><div class="hud-empty">No signal.</div></div>
           </div>
-          <div id="sys-queues"></div>
-        </div>
-
-        <div class="grid" style="grid-template-columns:1fr 1fr;align-items:stretch">
-          <div class="card">
-            <div class="card-h"><div><h3>Per-key concurrency</h3><div class="sub">Live in-flight requests per API key (cap: <span id="sys-key-limit">—</span>).</div></div></div>
-            <div id="sys-key-inflight"><div class="empty">No keys currently in flight.</div></div>
-          </div>
-          <div class="card">
-            <div class="card-h"><div><h3>Services</h3><div class="sub">Every process this gateway depends on.</div></div></div>
-            <div class="svc-grid" id="sys-services"></div>
+          <div class="hud-panel">
+            <div class="hud-panel-h">SYSTEM LINKS</div>
+            <div class="hud-svc-grid" id="hud-services"></div>
+            <div class="hud-panel-h" style="margin-top:18px">QUEUE ALLOCATION</div>
+            <div id="hud-queues"></div>
           </div>
         </div>
 
-        <div class="card">
-          <div class="card-h"><div><h3>Live requests</h3><div class="sub">Last 60 requests across every user — newest first.</div></div>
-            <button class="btn ghost" onclick="loadSystem()">↻ Refresh now</button></div>
-          <div class="tablewrap" style="max-height:520px;overflow-y:auto"><table id="sys-requests"></table></div>
+        <div class="hud-panel">
+          <div class="hud-panel-h">LIVE REQUEST FEED <button class="hud-btn" onclick="loadSystem()">⟳ SYNC</button></div>
+          <div class="hud-feed" id="hud-feed"><div class="hud-empty">No signal.</div></div>
         </div>
       </section>
 
@@ -627,27 +743,30 @@ async function runDemo(){
     if(r.ok)loadAll();
   }catch(e){out.textContent='Request failed: '+e;}finally{btn.disabled=false;}
 }
-// ---------- SYSTEM DASHBOARD ----------
-let SYS_HIST=[];        // rolling {t,util,running,promptTok,genTok} for sparkline + tok/s delta
+// ---------- OPS CONSOLE (HUD) ----------
+const GAUGE_C=326.7; // 2*pi*52, matches the SVG circle radius in CSS
 let SYS_PREV=null;
-function sevClass(pct){return pct>=90?'crit':pct>=70?'warn':'';}
 function fmtNum(n){return n==null?'—':Math.round(n).toLocaleString();}
-function fmtPct(n){return n==null?'—':n.toFixed(1)+'%';}
-function sparkline(el,vals,max){
-  if(!vals.length){el.innerHTML='';return;}
-  const w=el.clientWidth||200,h=36,m=max||Math.max(1,...vals);
-  const pts=vals.map((v,i)=>`${(i/(vals.length-1||1)*w).toFixed(1)},${(h-(v/m)*h).toFixed(1)}`).join(' ');
-  el.setAttribute('viewBox',`0 0 ${w} ${h}`);
-  const col=getComputedStyle(document.body).getPropertyValue('--accent').trim();
-  el.innerHTML=`<polyline points="${esc(pts)}" fill="none" stroke="${col}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+function fmtPct(n){return n==null?'—':n.toFixed(0)+'%';}
+function sevWord(pct){return pct>=90?'crit':pct>=70?'warn':'';}
+function setGauge(id,vid,pct,label){
+  const circle=document.getElementById(id), val=document.getElementById(vid);
+  const p=Math.max(0,Math.min(100,pct||0));
+  circle.style.strokeDashoffset=(GAUGE_C*(1-p/100)).toFixed(1);
+  circle.setAttribute('class','hud-gauge-fill '+sevWord(p));
+  val.textContent=label!==undefined?label:fmtPct(pct);
 }
 function timeAgo(ts){
   if(!ts)return '—';
   const s=(Date.now()-new Date(ts).getTime())/1000;
-  if(s<60)return Math.floor(s)+'s ago';
-  if(s<3600)return Math.floor(s/60)+'m ago';
-  return Math.floor(s/3600)+'h ago';
+  if(s<5)return 'now';
+  if(s<60)return Math.floor(s)+'s';
+  if(s<3600)return Math.floor(s/60)+'m';
+  return Math.floor(s/3600)+'h';
 }
+function tick(){document.getElementById('hud-clock').textContent=new Date().toUTCString().slice(17,25)+' UTC';}
+setInterval(tick,1000); tick();
+
 async function loadSystem(){
   let d;
   try{d=await api('GET','/admin-api/system');}catch(e){return;}
@@ -655,7 +774,26 @@ async function loadSystem(){
   const now=Date.now();
   const gpu=d.gpu||{}, v=d.vllm||{};
 
-  // ---- headline stats, with a live tokens/sec derived from the delta since the last poll ----
+  // ---- overall status pill: worst of GPU util / KV cache / any service down ----
+  const svc=d.services||{};
+  const svcDown=!d.vllm_up||!svc.mysql||!svc.embed||(svc.ocr||[]).some(o=>!o.up);
+  const worstPct=Math.max(gpu.utilization_pct||0,v.kv_cache_usage_pct||0);
+  const statusEl=document.getElementById('hud-status'), statusTxt=document.getElementById('hud-status-text');
+  if(svcDown){statusEl.className='hud-status crit';statusTxt.textContent='DEGRADED — SERVICE DOWN';}
+  else if(worstPct>=90){statusEl.className='hud-status crit';statusTxt.textContent='CRITICAL LOAD';}
+  else if(worstPct>=70){statusEl.className='hud-status warn';statusTxt.textContent='ELEVATED LOAD';}
+  else{statusEl.className='hud-status';statusTxt.textContent='NOMINAL';}
+
+  // ---- reactor gauges ----
+  setGauge('hg-util','hgv-util',gpu.utilization_pct);
+  const memPct=gpu.mem_total_mb?gpu.mem_used_mb/gpu.mem_total_mb*100:0;
+  setGauge('hg-vram','hgv-vram',memPct);
+  document.getElementById('hgl-vram').textContent=gpu.mem_used_mb!=null?
+    `${(gpu.mem_used_mb/1024).toFixed(1)} / ${(gpu.mem_total_mb/1024).toFixed(1)} GB`:'MEMORY';
+  setGauge('hg-kv','hgv-kv',v.kv_cache_usage_pct);
+  setGauge('hg-prefix','hgv-prefix',v.prefix_cache_hit_pct);
+
+  // ---- telemetry (live tok/s derived from the delta since the last poll) ----
   let promptTps='—', genTps='—';
   if(SYS_PREV && v.prompt_tokens_total!=null){
     const dt=(now-SYS_PREV.t)/1000;
@@ -665,75 +803,57 @@ async function loadSystem(){
     }
   }
   SYS_PREV={t:now,promptTok:v.prompt_tokens_total||0,genTok:v.generation_tokens_total||0};
-  document.getElementById('sys-stats').innerHTML=stat([
-    ['Running', fmtNum(v.running)], ['Waiting', fmtNum(v.waiting)],
-    ['Prompt tok/s', promptTps], ['Gen tok/s', genTps],
-    ['Avg latency', v.avg_e2e_latency_ms!=null?Math.round(v.avg_e2e_latency_ms)+'ms':'—'],
-    ['Idle for', d.idle_seconds!=null?Math.round(d.idle_seconds)+'s':'—'],
-  ]);
+  document.getElementById('ht-rw').textContent=d.vllm_up?`${fmtNum(v.running)} / ${fmtNum(v.waiting)}`:'OFFLINE';
+  document.getElementById('ht-ptps').textContent=promptTps;
+  document.getElementById('ht-gtps').textContent=genTps;
+  document.getElementById('ht-lat').textContent=v.avg_e2e_latency_ms!=null?Math.round(v.avg_e2e_latency_ms)+'ms':'—';
+  document.getElementById('ht-temp').textContent=gpu.temp_c!=null?`${gpu.temp_c}°C · ${Math.round(gpu.power_w||0)}W`:'—';
+  document.getElementById('ht-idle').textContent=d.idle_seconds!=null?Math.round(d.idle_seconds)+'s':'—';
 
-  // ---- GPU ----
-  document.getElementById('sys-gpu-name').textContent=gpu.name||'GPU stats unavailable (nvidia-smi failed)';
-  const util=gpu.utilization_pct??0;
-  document.getElementById('sys-gpu-util-v').textContent=fmtPct(gpu.utilization_pct);
-  const ub=document.getElementById('sys-gpu-util-bar'); ub.style.width=util+'%'; ub.className='bar-fill '+sevClass(util);
-  const memPct=gpu.mem_total_mb?gpu.mem_used_mb/gpu.mem_total_mb*100:0;
-  document.getElementById('sys-gpu-mem-v').textContent=gpu.mem_used_mb!=null?
-    `${(gpu.mem_used_mb/1024).toFixed(1)} / ${(gpu.mem_total_mb/1024).toFixed(1)} GB`:'—';
-  const mb=document.getElementById('sys-gpu-mem-bar'); mb.style.width=memPct+'%'; mb.className='bar-fill '+sevClass(memPct);
-  const tempPct=gpu.temp_c?Math.min(100,gpu.temp_c/90*100):0;
-  document.getElementById('sys-gpu-temp-v').textContent=gpu.temp_c!=null?`${gpu.temp_c}°C · ${Math.round(gpu.power_w||0)}W`:'—';
-  const tb=document.getElementById('sys-gpu-temp-bar'); tb.style.width=tempPct+'%'; tb.className='bar-fill '+sevClass(tempPct);
-
-  SYS_HIST.push(util); if(SYS_HIST.length>30)SYS_HIST.shift();
-  sparkline(document.getElementById('sys-gpu-util-spark'),SYS_HIST,100);
-
-  // ---- vLLM engine ----
-  document.getElementById('sys-vllm-rw').textContent=d.vllm_up?`${fmtNum(v.running)} / ${fmtNum(v.waiting)}`:'vLLM unreachable';
-  const kv=v.kv_cache_usage_pct||0;
-  document.getElementById('sys-kv-v').textContent=fmtPct(v.kv_cache_usage_pct);
-  const kb=document.getElementById('sys-kv-bar'); kb.style.width=kv+'%'; kb.className='bar-fill '+sevClass(kv);
-  const pfx=v.prefix_cache_hit_pct||0;
-  document.getElementById('sys-prefix-v').textContent=fmtPct(v.prefix_cache_hit_pct);
-  const pb=document.getElementById('sys-prefix-bar'); pb.style.width=pfx+'%';
-
-  // ---- per-class scheduler queues ----
+  // ---- queue allocation, segmented ----
   const cls=(d.scheduler&&d.scheduler.classes)||[];
   const total=(d.scheduler&&d.scheduler.total_slots)||1;
-  document.getElementById('sys-queues').innerHTML=cls.map(c=>{
-    const pct=c.in_flight/total*100;
-    return `<div class="qrow"><div class="qrow-h"><span>${esc(c.name)}</span>
-      <span class="n">${c.in_flight} running · ${c.reserved} reserved · ${total} total pool</span></div>
-      <div class="barwrap"><div class="bar-fill ${sevClass(c.in_flight/Math.max(1,c.reserved)*100)}" style="width:${Math.min(100,pct)}%"></div></div></div>`;
-  }).join('')||'<div class="empty">No queue data.</div>';
+  document.getElementById('hud-queues').innerHTML=cls.map(c=>{
+    const segs=Array.from({length:c.reserved||1},(_,i)=>
+      `<div class="hud-q-seg ${i<c.in_flight?'fill '+sevWord(c.in_flight/Math.max(1,c.reserved)*100):''}"></div>`).join('');
+    return `<div class="hud-q"><div class="hud-q-h"><span>${esc(c.name)}</span><b>${c.in_flight}/${c.reserved} · pool ${total}</b></div>
+      <div class="hud-q-track">${segs}</div></div>`;
+  }).join('')||'<div class="hud-empty">No queue data.</div>';
 
-  // ---- per-key concurrency ----
-  document.getElementById('sys-key-limit').textContent=(d.key_concurrency&&d.key_concurrency.limit)??'—';
-  const topKeys=(d.key_concurrency&&d.key_concurrency.top_keys)||[];
-  document.getElementById('sys-key-inflight').innerHTML=topKeys.length?
-    topKeys.map(k=>`<div class="qrow"><div class="qrow-h"><span>${esc(k.name)}</span>
-      <span class="n">${k.in_flight} / ${d.key_concurrency.limit} in flight</span></div>
-      <div class="barwrap"><div class="bar-fill ${sevClass(k.in_flight/d.key_concurrency.limit*100)}"
-        style="width:${Math.min(100,k.in_flight/d.key_concurrency.limit*100)}%"></div></div></div>`).join('')
-    :'<div class="empty">No keys currently in flight.</div>';
+  // ---- services as indicator LEDs ----
+  const pills=[['GATEWAY',svc.gateway],['VLLM',d.vllm_up],['MYSQL',svc.mysql],['EMBED',svc.embed]];
+  (svc.ocr||[]).forEach((o,i)=>pills.push([`OCR-${i+1}`,o.up]));
+  document.getElementById('hud-services').innerHTML=pills.map(([name,up])=>
+    `<div class="hud-svc"><span class="hud-svc-led ${up?'on':'off'}"></span>${esc(name)}</div>`).join('');
 
-  // ---- services ----
-  const svc=d.services||{};
-  const pills=[['Gateway',svc.gateway],['vLLM',d.vllm_up],['MySQL',svc.mysql],['Embeddings',svc.embed]];
-  (svc.ocr||[]).forEach((o,i)=>pills.push([`OCR ${i+1}`,o.up]));
-  document.getElementById('sys-services').innerHTML=pills.map(([name,up])=>
-    `<div class="svc-pill"><span class="svc-dot ${up?'on':'off'}"></span>${esc(name)}</div>`).join('');
+  // ---- active operators: distinct identities seen in the recent window, health-checks excluded ----
+  const rows=(d.recent_requests||[]).filter(r=>r.path!=='/health');
+  const byAuth=new Map();
+  for(const r of rows){ // rows are newest-first, so the first hit per auth is their latest
+    if(!byAuth.has(r.auth))byAuth.set(r.auth,{...r,count:0});
+    byAuth.get(r.auth).count++;
+  }
+  const ops=[...byAuth.values()].sort((a,b)=>new Date(b.ts)-new Date(a.ts));
+  document.getElementById('hud-ops-count').textContent=ops.length;
+  document.getElementById('hud-operators').innerHTML=ops.length?ops.map(o=>{
+    const live=(Date.now()-new Date(o.ts).getTime())/1000<10;
+    return `<div class="hud-op ${live?'live':''}">
+      <div class="hud-op-h"><span class="hud-op-dot"></span>${esc(o.auth||'unknown')}</div>
+      <div class="hud-op-ep">${esc(o.method)} ${esc(o.path)}</div>
+      <div class="hud-op-meta"><span>${o.count} req</span><span>${esc(timeAgo(o.ts))} ago</span></div>
+    </div>`;
+  }).join(''):'<div class="hud-empty">No signal.</div>';
 
-  // ---- live requests table ----
-  const rows=d.recent_requests||[];
-  const h=`<thead><tr><th>Time</th><th>Auth</th><th>Method</th><th>Path</th><th>Status</th><th>Latency</th><th>IP</th></tr></thead>`;
-  document.getElementById('sys-requests').innerHTML=h+'<tbody>'+(rows.length?rows.map(r=>{
+  // ---- live feed terminal ----
+  document.getElementById('hud-feed').innerHTML=rows.length?rows.map(r=>{
     const slow=r.ms>=5000, err=r.status>=400;
-    const cls=err?'reqrow-err':(slow?'reqrow-slow':'');
-    return `<tr><td class="mono">${esc(timeAgo(r.ts))}</td><td>${esc(r.auth)}</td><td class="mono">${esc(r.method)}</td>
-      <td class="mono">${esc(r.path)}</td><td class="${cls}">${r.status}</td><td class="${cls}">${r.ms}ms</td>
-      <td class="mono">${esc(r.ip)}</td></tr>`;
-  }).join(''):'<tr><td colspan="7"><div class="empty">No requests yet.</div></td></tr>')+'</tbody>';
+    return `<div class="hud-feed-row ${err?'err':(slow?'slow':'')}">
+      <span class="t">${esc(timeAgo(r.ts))}</span>
+      <span class="who">${esc(r.auth||'—')}</span>
+      <span class="ep">${esc(r.method)} ${esc(r.path)}</span>
+      <span class="st">${r.status} · ${r.ms}ms</span>
+    </div>`;
+  }).join(''):'<div class="hud-empty">No signal.</div>';
 }
 
 function logout(){['av_session','av_role','av_name'].forEach(k=>localStorage.removeItem(k));location.reload();}
