@@ -13,8 +13,15 @@ if curl -sf http://localhost:7777/health >/dev/null 2>&1; then
   echo "vLLM already running on 7777"
 else
   pkill -f "vllm.entrypoints" 2>/dev/null; sleep 3
-  export FLASHINFER_CUDA_ARCH_LIST="12.0f"
+  # "12.0f" (family-conditional PTX) needs CUDA >=12.9 to even compile and
+  # isn't what this GPU's toolchain resolves anyway — plain "12.0" (this
+  # card's real compute capability, RTX PRO 6000 Blackwell = sm_120) is what
+  # actually builds. Needs CUDA toolkit 12.9+ on PATH (13.0 installed at
+  # /usr/local/cuda) — CUDA 12.6/12.8 both failed this model's FlashInfer/
+  # Triton kernel builds outright (nvcc/"SM 12.x requires CUDA >= 12.9").
+  export FLASHINFER_CUDA_ARCH_LIST="12.0"
   export VLLM_USE_DEEP_GEMM=0
+  export PATH=/usr/local/cuda/bin:$PATH
   nohup /workspace/venv/bin/python -m vllm.entrypoints.openai.api_server \
     --model /workspace/models/Qwen3.6-35B-A3B-FP8 \
     --served-model-name qwen3.6-35b \

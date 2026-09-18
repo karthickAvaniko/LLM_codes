@@ -22,6 +22,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from PIL import Image
+from starlette.background import BackgroundTask
 
 LOG_DIR = Path("/workspace/logs")
 LOG_DIR.mkdir(exist_ok=True)
@@ -403,6 +404,66 @@ async def _persist_loop():
                 for k in [k for k, w in d.items() if not w or w[-1] < horizon]:
                     del d[k]
 
+# ── Per-API-key concurrency cap — added 2026-09-18 ──────────────────────────
+# _check_rate_limit() above only bounds requests/min and requests/day; it
+# does nothing about how many of those requests are running AT ONCE. A key
+# that fires 10 requests in the same second was passing straight through to
+# vLLM, driving "Running" sequences up to 5 concurrently and stalling other
+# users' plain-text calls for 17-77s (see vllm.log 2026-09-17 11:11-11:12,
+# and _VLLMScheduler's VISION-class comment above for the same incident from
+# the GPU-scheduling side). This caps a single key's IN-FLIGHT request count
+# at the gateway's front door, independent of and *before* _VLLMScheduler's
+# per-class admission — request 4..N from the same key queue here first.
+KEY_CONCURRENCY_LIMIT = 3
+_key_inflight = defaultdict(int)
+_key_concurrency_cond = asyncio.Condition()
+
+async def _acquire_key_slot(key_hash: str):
+    async with _key_concurrency_cond:
+        await _key_concurrency_cond.wait_for(
+            lambda: _key_inflight[key_hash] < KEY_CONCURRENCY_LIMIT)
+        _key_inflight[key_hash] += 1
+
+async def _release_key_slot(key_hash: str):
+    async with _key_concurrency_cond:
+        _key_inflight[key_hash] -= 1
+        _key_concurrency_cond.notify_all()
+
+# ── vLLM keep-alive — added 2026-09-18 ──────────────────────────────────────
+# A request landing on a genuinely idle engine measured 6.3 tokens/s
+# generation (vs. the usual 40-100+ tok/s warm) -- a 30.5s wait for a
+# 51-token reply with NOBODY ELSE on the GPU (vllm.log 2026-09-17 20:24:35,
+# "Running: 1 reqs", after ~3h with no traffic). This is a cold-start tax,
+# not contention -- a periodic tiny ping keeps CUDA graphs/kernels warm so
+# the first real request after a quiet period doesn't pay it. Calls vLLM
+# directly on its internal port (7777), never through the public gateway
+# port -- it never touches _resolve_key/_check_rate_limit/the per-key
+# concurrency cap and never appears in access.jsonl as real traffic.
+_last_request_ts = time.time()
+VLLM_IDLE_KEEPALIVE_SECS = 120
+
+async def _vllm_keepalive_loop():
+    global _last_request_ts
+    async with httpx.AsyncClient(timeout=30) as c:
+        while True:
+            await asyncio.sleep(30)
+            idle_for = time.time() - _last_request_ts
+            if idle_for < VLLM_IDLE_KEEPALIVE_SECS:
+                continue
+            try:
+                await c.post(f"{VLLM_URL}/v1/chat/completions", json={
+                    "model": MODEL,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 1, "temperature": 0.0,
+                })
+                log.info(f"vLLM keep-alive ping sent (idle {int(idle_for)}s)")
+            except Exception as e:
+                log.warning(f"vLLM keep-alive ping failed: {e}")
+            # Counts as activity too, so this doesn't fire every 30s forever
+            # once idle -- one warm-up ping per idle period is enough; the
+            # timer resets and only fires again after another full idle gap.
+            _last_request_ts = time.time()
+
 # Paths reachable without a key (UI shells + health probe).
 # /keys is only the HTML shell — every action it performs calls /admin/*,
 # which the middleware locks to the master admin key.
@@ -410,7 +471,7 @@ async def _persist_loop():
 # (protected by per-IP and per-email limits, trial quotas, 30-day expiry).
 PUBLIC_PATHS = {"/", "/health", "/favicon.ico", "/keys", "/getkey", "/signup/key",
                 "/console", "/admin", "/auth/login", "/auth/admin-login",
-                "/auth/register", "/auth/signin"}
+                "/auth/register", "/auth/signin", "/v1/extract"}
 
 def _is_ocr_endpoint(method: str, path: str) -> bool:
     """OCR / invoice-to-JSON document endpoints — gated by the per-key
@@ -433,6 +494,14 @@ app.add_middleware(
 async def require_api_key(request: Request, call_next):
     start = time.time()
     ip    = _client_ip(request)
+
+    # Marks the engine as "recently active" for the keep-alive loop above.
+    # Excludes /health specifically -- the watchdog polls it every 15s
+    # (gateway_watchdog.sh), which would otherwise never let the idle timer
+    # reach VLLM_IDLE_KEEPALIVE_SECS and the keep-alive would never fire.
+    if request.url.path != "/health":
+        global _last_request_ts
+        _last_request_ts = time.time()
 
     if request.method == "OPTIONS" or request.url.path in PUBLIC_PATHS:
         response = await call_next(request)
@@ -524,6 +593,11 @@ async def require_api_key(request: Request, call_next):
         return JSONResponse(status_code=403,
                             content={"error": {"message": "Admin key required", "type": "permission_error"}})
 
+    # Per-key concurrency cap (see _acquire_key_slot above). Only real API
+    # keys are capped — the master admin key resolves to key_hash=None and
+    # is exempt, same as it already is for rate limiting.
+    if key_hash:
+        await _acquire_key_slot(key_hash)
     try:
         response = await call_next(request)
     except ContextOverflow:
@@ -536,6 +610,22 @@ async def require_api_key(request: Request, call_next):
         response = JSONResponse(status_code=500, content={"error": {
             "message": "Internal server error — details are in the server logs.",
             "type": "server_error"}})
+    if key_hash:
+        # Release only after the response body is fully sent, not right after
+        # call_next() returns — for a StreamingResponse (SSE chat/ask), the
+        # generator that actually drives the vLLM call hasn't finished
+        # executing yet at this point, so releasing here would let request
+        # N+1 in as soon as headers are ready instead of when the work is
+        # actually done, defeating the cap for exactly the streaming paths
+        # (chat, /files/ask) that most need it.
+        prior_bg = response.background
+        async def _release(bg=prior_bg, kh=key_hash):
+            try:
+                if bg is not None:
+                    await bg()
+            finally:
+                await _release_key_slot(kh)
+        response.background = BackgroundTask(_release)
     _log_async(ACCESS_LOG, {"ip": ip, "method": request.method,
                                "path": request.url.path, "status": response.status_code,
                                "ms": int((time.time() - start) * 1000), "auth": user})
@@ -1010,22 +1100,29 @@ def _wants_json(question: str) -> bool:
     q = (question or "").lower()
     return any(k in q for k in ("json", "structured data", "schema"))
 
-# ── vLLM request scheduler — soft priority queues (DOCUMENT / CHAT / AGENT) ──
-# Single GPU (RTX A6000, 49GB) has no room for a second full model instance
-# (one copy of Qwen3.6-35B-A3B already uses ~43GB), so there is only ever one
-# vLLM engine and one shared KV cache pool — this does NOT partition the KV
-# cache. It's gateway-side admission control so a batch of heavy document/
-# invoice jobs (map-reduce can fire many chunk calls back to back) can't
-# occupy every one of vLLM's concurrent request slots and starve interactive
-# chat/agent latency. Every outgoing call to VLLM_URL goes through this.
+# ── vLLM request scheduler — soft priority queues (DOCUMENT / CHAT / AGENT / VISION) ──
+# Single GPU has no room for a second full model instance (one copy of
+# Qwen3.6-35B-A3B already uses ~41GB), so there is only ever one vLLM engine
+# and one shared KV cache pool — this does NOT partition the KV cache. It's
+# gateway-side admission control so a batch of heavy document/invoice jobs
+# (map-reduce can fire many chunk calls back to back) can't occupy every one
+# of vLLM's concurrent request slots and starve interactive chat/agent
+# latency. Every outgoing call to VLLM_URL goes through this.
+#
+# VISION added 2026-09-18 after a real incident: a user (10 concurrent
+# image/vision-hybrid extraction calls) drove "Running" sequences up to 5,
+# and other users' plain-text requests sharing that same DOCUMENT bucket
+# stalled for 17-77s (see vllm.log 2026-09-17 11:11-11:12) — heavy
+# multimodal prefill was crowding out cheap text calls with no isolation.
+# VISION now gets its own reserved ceiling so an image burst can't eat
+# DOCUMENT's (or anyone else's) slots. Reservations sum to the full 7 (a
+# strict partition, not a soft minimum) — tune per real traffic mix, not
+# blindly; CHAT's reservation was traded down from 3->2 to make room.
 _VLLM_TOTAL_SLOTS = 7   # vLLM launched with --max-num-seqs 8 (start_all.sh);
                         # keep 1 slot of headroom outside this accounting for
                         # calls that bypass the scheduler (e.g. /health).
-_VLLM_RESERVED = {"CHAT": 3, "AGENT": 1, "DOCUMENT": 3}   # always-available
-                                                           # minimum per class;
-                                                           # CHAT/DOCUMENT split
-                                                           # equal, AGENT keeps
-                                                           # 1 dedicated slot
+_VLLM_RESERVED = {"CHAT": 2, "AGENT": 1, "VISION": 2, "DOCUMENT": 2}   # always-available
+                                                           # minimum per class
 assert sum(_VLLM_RESERVED.values()) <= _VLLM_TOTAL_SLOTS
 
 class _VLLMScheduler:
@@ -1407,6 +1504,7 @@ async def startup():
     loop.run_in_executor(None, _warm_ocr)
     loop.run_in_executor(None, _ensure_extraction_cache_table)
     asyncio.create_task(_persist_loop())
+    asyncio.create_task(_vllm_keepalive_loop())
     # files caught mid-extraction by a restart would stay "processing" forever
     for meta in _owner_metas("admin"):
         if meta.get("status") == "processing":
@@ -2799,7 +2897,8 @@ async def _self_correct(fname: str, doc_text: str, answer: str, issues: list,
     )
     messages = (_vision_doc_messages(fname, doc_text, images, fix_task) if images
                 else _doc_messages(fname, doc_text, fix_task))
-    return await _llm_retry_truncation(messages, key_hash, max_tokens=8192, response_format=response_format)
+    return await _llm_retry_truncation(messages, key_hash, max_tokens=8192, response_format=response_format,
+                                       queue_class="VISION" if images else "DOCUMENT")
 
 # ── Batch: multiple PDFs in ONE request → JSON per file ──
 MAX_BATCH_FILES  = 20
@@ -2834,7 +2933,8 @@ async def _extract_critical_fields(fname: str, doc_text: str, images: list[bytes
     else:
         messages = _doc_messages(fname, doc_text, _CRITICAL_FIELD_TASK)
     try:
-        ans = await _llm_retry_truncation(messages, key_hash, max_tokens=512)
+        ans = await _llm_retry_truncation(messages, key_hash, max_tokens=512,
+                                          queue_class="VISION" if images else "DOCUMENT")
     except (ContextOverflow, OutputTruncated):
         return None
     d = _try_json(ans)
@@ -2966,7 +3066,8 @@ async def batch_extract(request: Request,
                         try:
                             ans = await _llm_retry_truncation(
                                 _vision_doc_messages(fname, doc_text, images, effective_question),
-                                key_hash, max_tokens=8192, response_format=response_format)
+                                key_hash, max_tokens=8192, response_format=response_format,
+                                queue_class="VISION")
                             vision_used = True
                             return ans, "vision_hybrid"
                         except ContextOverflow:
@@ -3725,6 +3826,7 @@ async def files_ask(
             # 2) map phase for big docs (also slow — keep the events flowing)
             single_shot = total <= SINGLE_SHOT_CHARS
             images, doc_text = [], _pages_text(pages)
+            used_vision = False   # set True only if page images actually go to vLLM
 
             async def _map_reduce_flow():
                 """Chunk -> map -> hierarchical reduce -> final messages.
@@ -3777,6 +3879,7 @@ async def files_ask(
                     images = await loop.run_in_executor(None, extract_page_images, content0, fn0, pages)
                 if images and len(images) <= MAX_VISION_PAGES:
                     messages = _vision_doc_messages(fname, doc_text, images, question)
+                    used_vision = True
                 else:
                     messages = _doc_messages(fname, doc_text, question)
             else:
@@ -3814,7 +3917,8 @@ async def files_ask(
                 # and tier-escalation every other extraction path already
                 # gets (/v1/extract, /v1/files/{id}/ask via answer_document()).
                 async def _one_shot():
-                    return await _llm_retry_truncation(messages, key_hash, max_tokens=8192)
+                    return await _llm_retry_truncation(messages, key_hash, max_tokens=8192,
+                                                       queue_class="VISION" if used_vision else "DOCUMENT")
 
                 try:
                     async for kind, val in _await_with_progress(_one_shot(), "Extracting…"):
