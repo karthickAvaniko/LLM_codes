@@ -4,14 +4,19 @@
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Avaniko AI</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{
-  --bg:#0f0f11;--surface:#18181b;--border:#27272a;
-  --text:#f4f4f5;--muted:#71717a;--accent:#8b5cf6;
-  --accent-hover:#7c3aed;--user-bg:#1e1b4b;--ai-bg:#18181b;
+  --bg:#0b0b0e;--surface:#16161a;--surface2:#1c1c22;--border:#27272a;--border2:#323238;
+  --text:#f4f4f5;--muted:#84848f;--accent:#8b5cf6;
+  --accent-hover:#7c3aed;--accent-soft:rgba(139,92,246,.14);--user-bg:#241f52;--ai-bg:#16161a;
+  --green:#22c55e;--green-soft:rgba(34,197,94,.13);--red:#f43f5e;--red-soft:rgba(244,63,94,.12);--amber:#f59e0b;
 }
-html,body{height:100%;font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text)}
+html,body{height:100%;font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--text)}
+h1,h2,h3,.logo,.brandtitle,.btn-primary,.big-logo{font-family:'Sora','Inter',sans-serif;letter-spacing:-.01em}
 body{display:flex;height:100vh;overflow:hidden}
 
 /* ── History sidebar ── */
@@ -212,20 +217,84 @@ header span{font-size:.78rem;color:var(--muted);margin-left:4px}
 #welcome{
   flex:1;display:flex;flex-direction:column;align-items:center;
   justify-content:center;gap:16px;padding:40px 20px;text-align:center;
+  position:relative;overflow:hidden;
 }
+#welcome::before{content:"";position:absolute;width:520px;height:520px;border-radius:50%;top:-220px;left:50%;
+  transform:translateX(-50%);background:radial-gradient(circle,rgba(139,92,246,.16),transparent 65%);
+  filter:blur(10px);pointer-events:none}
+#welcome>*{position:relative}
 #welcome .big-logo{
   width:64px;height:64px;background:linear-gradient(135deg,#8b5cf6,#6d28d9);
-  border-radius:16px;display:flex;align-items:center;justify-content:center;
-  font-weight:900;font-size:1.6rem;color:#fff;
+  border-radius:18px;display:flex;align-items:center;justify-content:center;
+  font-weight:800;font-size:1.6rem;color:#fff;box-shadow:0 10px 30px rgba(139,92,246,.35);
+  animation:rise .5s cubic-bezier(.2,.8,.2,1);
 }
-#welcome h2{font-size:1.5rem;font-weight:700}
+@keyframes rise{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+#welcome h2{font-size:1.6rem;font-weight:700}
 #welcome p{color:var(--muted);font-size:.9rem;max-width:400px;line-height:1.6}
 .pills{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-top:8px}
 .pill{
   padding:8px 16px;border-radius:999px;border:1px solid var(--border);
   font-size:.82rem;cursor:pointer;transition:all .2s;background:var(--surface);
 }
-.pill:hover{border-color:var(--accent);color:var(--accent)}
+.pill:hover{border-color:var(--accent);color:var(--accent);transform:translateY(-1px)}
+
+/* ── Activate-access banner (welcome state, no key yet) ── */
+#activate-banner{
+  display:none;align-items:center;gap:12px;background:var(--surface);border:1px solid var(--accent);
+  border-radius:14px;padding:14px 18px;margin-top:10px;max-width:420px;text-align:left;
+  box-shadow:0 8px 24px rgba(139,92,246,.15);
+}
+#activate-banner .ab-ic{font-size:1.3rem;flex-shrink:0}
+#activate-banner .ab-txt{flex:1;font-size:.82rem;color:var(--text2,var(--text))}
+#activate-banner .ab-txt b{display:block;font-size:.88rem;margin-bottom:2px}
+#activate-banner button{flex-shrink:0}
+
+/* ── Modal (replaces all native prompt()/alert()) ── */
+.modal-overlay{
+  display:none;position:fixed;inset:0;z-index:100;align-items:center;justify-content:center;
+  background:rgba(5,5,8,.72);backdrop-filter:blur(4px);padding:20px;
+}
+.modal-overlay.show{display:flex}
+.modal-card{
+  width:100%;max-width:420px;background:var(--surface);border:1px solid var(--border2);
+  border-radius:18px;padding:26px;box-shadow:0 20px 60px rgba(0,0,0,.55);
+  animation:rise .35s cubic-bezier(.2,.8,.2,1);
+}
+.modal-card h3{font-size:1.15rem;font-weight:700;margin-bottom:4px}
+.modal-card .msub{color:var(--muted);font-size:.82rem;margin-bottom:18px;line-height:1.5}
+.modal-tabs{display:flex;gap:6px;background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:3px;margin-bottom:16px}
+.modal-tab{flex:1;text-align:center;padding:8px;border-radius:8px;font-size:.82rem;font-weight:600;
+  color:var(--muted);cursor:pointer;transition:.15s}
+.modal-tab.active{background:var(--accent-soft);color:var(--accent)}
+.modal-field{margin-bottom:12px}
+.modal-field label{display:block;font-size:.76rem;color:var(--muted);margin-bottom:6px}
+.modal-field input{width:100%;background:var(--bg);border:1px solid var(--border);border-radius:9px;
+  padding:11px 13px;color:var(--text);font-size:.88rem;outline:none;font-family:inherit;transition:.15s}
+.modal-field input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.btn-primary{width:100%;margin-top:6px;background:linear-gradient(135deg,var(--accent),#6d28d9);border:none;
+  border-radius:10px;color:#fff;padding:12px;font-size:.88rem;font-weight:600;cursor:pointer;transition:.15s;
+  box-shadow:0 6px 18px rgba(139,92,246,.3)}
+.btn-primary:hover{filter:brightness(1.08)}
+.btn-primary:disabled{opacity:.55;cursor:wait}
+.modal-err{color:var(--red);font-size:.79rem;min-height:1.1em;margin-top:9px;text-align:center}
+.modal-close{position:absolute;top:16px;right:16px;background:none;border:none;color:var(--muted);
+  font-size:1.1rem;cursor:pointer;line-height:1}
+.modal-close:hover{color:var(--text)}
+.modal-card{position:relative}
+.keybox{display:flex;align-items:center;gap:8px;background:var(--bg);border:1px dashed var(--green);
+  border-radius:9px;padding:12px;margin:14px 0}
+.keybox code{flex:1;font-family:'Fira Code',monospace;font-size:.8rem;word-break:break-all;color:var(--green)}
+.keybox button{flex-shrink:0;background:none;border:1px solid var(--border);color:var(--text);border-radius:7px;
+  padding:6px 11px;font-size:.76rem;cursor:pointer;font-family:inherit}
+.keybox button:hover{border-color:var(--accent);color:var(--accent)}
+.modal-warn{color:var(--amber);font-size:.76rem;line-height:1.5;margin-bottom:4px}
+
+/* ── Toast (replaces alert()) ── */
+.toast{position:fixed;bottom:28px;left:50%;transform:translateX(-50%) translateY(10px);background:var(--surface);
+  border:1px solid var(--accent);border-radius:12px;padding:12px 20px;font-size:.85rem;font-weight:500;opacity:0;
+  transition:.3s;pointer-events:none;box-shadow:0 10px 30px rgba(0,0,0,.4);z-index:99;max-width:90vw}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 
 /* ── Mobile / responsive ── */
 @media (max-width:768px){
@@ -295,6 +364,11 @@ header span{font-size:.78rem;color:var(--muted);margin-left:4px}
       <div class="pill" onclick="quickSend('Summarize this document')">Summarize document</div>
       <div class="pill" onclick="quickSend('Write a Python hello world')">Write code</div>
     </div>
+    <div id="activate-banner">
+      <div class="ab-ic">🔑</div>
+      <div class="ab-txt"><b>Activate your access</b>You'll need an API key before you can chat.</div>
+      <button class="btn-primary" style="width:auto;margin:0;padding:9px 16px" onclick="openKeyModal()">Get started</button>
+    </div>
   </div>
 </div>
 
@@ -325,6 +399,43 @@ header span{font-size:.78rem;color:var(--muted);margin-left:4px}
 </div>
 <input type="file" id="file-input" multiple accept=".pdf,.png,.jpg,.jpeg,.webp,.txt,.csv,.xlsx,.docx" onchange="attachFile(event)"/>
 </div><!-- /main-area -->
+
+<!-- ============ Activate access modal (replaces prompt()/alert()) ============ -->
+<div class="modal-overlay" id="key-modal">
+  <div class="modal-card">
+    <button class="modal-close" onclick="closeKeyModal()">✕</button>
+    <h3>Activate your access</h3>
+    <div class="msub">One API key unlocks chat, document extraction and file storage.</div>
+
+    <div class="modal-tabs">
+      <div class="modal-tab active" id="tab-have" onclick="switchKeyTab('have')">I have a key</div>
+      <div class="modal-tab" id="tab-new" onclick="switchKeyTab('new')">Create a free key</div>
+    </div>
+
+    <div id="pane-have">
+      <div class="modal-field"><label>API key</label><input id="km-paste" placeholder="ak-..." autocomplete="off"
+        onkeydown="if(event.key==='Enter')submitPasteKey()"/></div>
+      <button class="btn-primary" onclick="submitPasteKey()">Continue</button>
+      <div class="modal-err" id="km-paste-err"></div>
+    </div>
+
+    <div id="pane-new" style="display:none">
+      <div class="modal-field"><label>Your name</label><input id="km-name" placeholder="Karthick M" maxlength="60"/></div>
+      <div class="modal-field"><label>Email</label><input id="km-email" type="email" placeholder="you@avaniko.com" maxlength="120"
+        onkeydown="if(event.key==='Enter')submitNewKey()"/></div>
+      <button class="btn-primary" id="km-new-btn" onclick="submitNewKey()">Get free API key</button>
+      <div class="modal-err" id="km-new-err"></div>
+    </div>
+
+    <div id="pane-result" style="display:none">
+      <div class="modal-warn">⚠ Shown once — copy it now, it can't be recovered later.</div>
+      <div class="keybox"><code id="km-result-key"></code><button onclick="copyResultKey()">Copy</button></div>
+      <button class="btn-primary" onclick="finishKeyModal()">Start chatting →</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
 
 <script>
 const chat    = document.getElementById('chat');
@@ -367,7 +478,7 @@ function onKey(e){
 // ── file attach (multiple supported) ──────────────────
 function attachFile(e){
   for(const f of e.target.files){
-    if(attachedFiles.length>=20){alert('Max 20 files at once — send the rest in a second message');break;}
+    if(attachedFiles.length>=20){toast('Max 20 files at once — send the rest in a second message');break;}
     attachedFiles.push(f);
   }
   e.target.value='';
@@ -491,13 +602,10 @@ function addBubble(role, content='', fileInfo=null){
 }
 
 // ── api key ───────────────────────────────────────────
+// No native prompt()/alert() anywhere in this product — every interruption
+// happens inline, in the page, via the modal/toast below.
 function getApiKey(){
-  let k=localStorage.getItem('avaniko_api_key');
-  if(!k){
-    k=(prompt('Enter your Avaniko API key (ak-...)')||'').trim();
-    if(k) localStorage.setItem('avaniko_api_key', k);
-  }
-  return k;
+  return localStorage.getItem('avaniko_api_key') || '';
 }
 
 function maskKey(k){
@@ -506,8 +614,76 @@ function maskKey(k){
 }
 
 function changeApiKey(){
-  const k=(prompt('Enter a different Avaniko API key (ak-...)')||'').trim();
-  if(k){ localStorage.setItem('avaniko_api_key', k); loadUserBox(); }
+  openKeyModal();
+}
+
+// ── toast (replaces alert()) ───────────────────────────
+function toast(m){
+  const t=document.getElementById('toast');
+  t.textContent=m; t.classList.add('show');
+  clearTimeout(t._h); t._h=setTimeout(()=>t.classList.remove('show'),2600);
+}
+
+// ── activate-access modal (replaces prompt()) ──────────
+let _resumeSendAfterKey=false;
+function openKeyModal(resumeSend){
+  _resumeSendAfterKey = !!resumeSend;
+  document.getElementById('key-modal').classList.add('show');
+  document.getElementById('pane-result').style.display='none';
+  switchKeyTab('have');
+  setTimeout(()=>document.getElementById('km-paste').focus(),50);
+}
+function closeKeyModal(){
+  document.getElementById('key-modal').classList.remove('show');
+}
+function switchKeyTab(which){
+  const have=which==='have';
+  document.getElementById('tab-have').classList.toggle('active',have);
+  document.getElementById('tab-new').classList.toggle('active',!have);
+  document.getElementById('pane-have').style.display=have?'block':'none';
+  document.getElementById('pane-new').style.display=have?'none':'block';
+  document.getElementById('pane-result').style.display='none';
+}
+function submitPasteKey(){
+  const k=document.getElementById('km-paste').value.trim();
+  const err=document.getElementById('km-paste-err');
+  if(!k.startsWith('ak-')){ err.textContent='That doesn\'t look like an Avaniko key (starts with "ak-").'; return; }
+  err.textContent='';
+  localStorage.setItem('avaniko_api_key', k);
+  loadUserBox();
+  closeKeyModal();
+  toast('API key activated ✓');
+  if(_resumeSendAfterKey){ _resumeSendAfterKey=false; send(); }
+}
+async function submitNewKey(){
+  const name=document.getElementById('km-name').value.trim();
+  const email=document.getElementById('km-email').value.trim();
+  const err=document.getElementById('km-new-err');
+  const btn=document.getElementById('km-new-btn');
+  err.textContent='';
+  if(!name||!email){ err.textContent='Enter your name and email.'; return; }
+  btn.disabled=true; btn.textContent='Generating…';
+  try{
+    const res=await fetch('/signup/key',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name,email})});
+    const data=await res.json();
+    if(!res.ok){ err.textContent=data.error?.message||'Failed — try again.'; return; }
+    localStorage.setItem('avaniko_api_key', data.api_key);
+    document.getElementById('km-result-key').textContent=data.api_key;
+    document.getElementById('pane-have').style.display='none';
+    document.getElementById('pane-new').style.display='none';
+    document.getElementById('pane-result').style.display='block';
+    loadUserBox();
+  }catch(e){ err.textContent='Gateway unreachable — try again.'; }
+  finally{ btn.disabled=false; btn.textContent='Get free API key'; }
+}
+function copyResultKey(){
+  navigator.clipboard.writeText(document.getElementById('km-result-key').textContent||'').then(()=>toast('Copied ✓'));
+}
+function finishKeyModal(){
+  closeKeyModal();
+  toast('API key activated ✓');
+  if(_resumeSendAfterKey){ _resumeSendAfterKey=false; send(); }
 }
 
 function copyApiKey(){
@@ -518,18 +694,31 @@ function copyApiKey(){
 }
 
 // ── user / api key box ────────────────────────────────
+function setActivateBanner(show){
+  const b=document.getElementById('activate-banner');
+  if(b) b.style.display = show ? 'flex' : 'none';
+}
 async function loadUserBox(){
   const box=document.getElementById('user-box');
   const key=localStorage.getItem('avaniko_api_key');
-  if(!key){ box.innerHTML='<span style="color:var(--muted)">No API key set yet</span>'; return; }
+  if(!key){
+    box.innerHTML='<span style="color:var(--muted)">No API key set yet</span>'+
+      '<button style="margin-top:8px;width:100%;padding:7px;border-radius:8px;border:1px solid var(--accent);'+
+      'background:var(--accent-soft);color:var(--accent);font-size:.78rem;font-weight:600;cursor:pointer;font-family:inherit"'+
+      ' onclick="openKeyModal()">Get started →</button>';
+    setActivateBanner(true);
+    return;
+  }
   try{
     const res=await fetch('/v1/usage',{headers:{'Authorization':'Bearer '+key}});
     if(res.status===401){
-      box.innerHTML='<span style="color:#f87171">⚠ Invalid API key</span>'+
+      box.innerHTML='<span style="color:var(--red)">⚠ Invalid API key</span>'+
         '<button style="margin-top:6px;width:100%;padding:6px;border-radius:7px;border:1px solid var(--border);'+
-        'background:transparent;color:var(--text);font-size:.75rem;cursor:pointer" onclick="localStorage.removeItem(\'avaniko_api_key\');changeApiKey()">Set new key</button>';
+        'background:transparent;color:var(--text);font-size:.75rem;cursor:pointer;font-family:inherit" onclick="localStorage.removeItem(\'avaniko_api_key\');changeApiKey()">Set new key</button>';
+      setActivateBanner(true);
       return;
     }
+    setActivateBanner(false);
     const u=await res.json();
     // first-ever load (no local override yet): start from the admin-set
     // per-key default so the toggle reflects what the console configured
@@ -628,6 +817,7 @@ async function send(){
   const text=msgEl.value.trim();
   const files=attachedFiles.slice();
   if(!text&&!files.length) return;
+  if(!getApiKey()){ openKeyModal(true); return; }   // message stays in the box — resumes after activation
 
   streaming=true;
   sendBtn.disabled=true;
