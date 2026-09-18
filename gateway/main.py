@@ -414,7 +414,11 @@ async def _persist_loop():
 # the GPU-scheduling side). This caps a single key's IN-FLIGHT request count
 # at the gateway's front door, independent of and *before* _VLLMScheduler's
 # per-class admission — request 4..N from the same key queue here first.
-KEY_CONCURRENCY_LIMIT = 3
+# Raised 3->6 2026-09-18 alongside --max-num-seqs 8->32 (see _VLLMScheduler
+# comment above) -- still meaningfully throttles a 10-at-once burst (4 would
+# queue) while not being the tightest bottleneck now that the GPU-side pool
+# is much bigger.
+KEY_CONCURRENCY_LIMIT = 6
 _key_inflight = defaultdict(int)
 _key_concurrency_cond = asyncio.Condition()
 
@@ -1115,13 +1119,24 @@ def _wants_json(question: str) -> bool:
 # stalled for 17-77s (see vllm.log 2026-09-17 11:11-11:12) — heavy
 # multimodal prefill was crowding out cheap text calls with no isolation.
 # VISION now gets its own reserved ceiling so an image burst can't eat
-# DOCUMENT's (or anyone else's) slots. Reservations sum to the full 7 (a
+# DOCUMENT's (or anyone else's) slots. Reservations sum to the full total (a
 # strict partition, not a soft minimum) — tune per real traffic mix, not
-# blindly; CHAT's reservation was traded down from 3->2 to make room.
-_VLLM_TOTAL_SLOTS = 7   # vLLM launched with --max-num-seqs 8 (start_all.sh);
-                        # keep 1 slot of headroom outside this accounting for
-                        # calls that bypass the scheduler (e.g. /health).
-_VLLM_RESERVED = {"CHAT": 2, "AGENT": 1, "VISION": 2, "DOCUMENT": 2}   # always-available
+# blindly.
+#
+# Raised 2026-09-18 (--max-num-seqs 8->32, start_all.sh) after checking
+# vLLM's own KV-cache allocation, not guessing: "GPU KV cache size:
+# 4,104,426 tokens, Maximum concurrency for 65,536 tokens per request:
+# 62.6x" at the SAME --gpu-memory-utilization 0.85 -- max-num-seqs=8 was an
+# artificial scheduler cap, not a memory limit; real requests are almost
+# always far shorter than 65,536 tokens too, so 32 concurrent stays well
+# inside the actual KV-cache budget. nvidia-smi also confirmed nothing else
+# (OCR is CPU-only) competes for this GPU's VRAM. Class split kept
+# proportional to the old 2/1/2/2 -- push further only after watching real
+# per-class "Running" counts and per-token throughput at this level first.
+_VLLM_TOTAL_SLOTS = 30   # vLLM launched with --max-num-seqs 32 (start_all.sh);
+                         # keep headroom outside this accounting for calls
+                         # that bypass the scheduler (e.g. /health).
+_VLLM_RESERVED = {"CHAT": 8, "AGENT": 4, "VISION": 8, "DOCUMENT": 8}   # always-available
                                                            # minimum per class
 assert sum(_VLLM_RESERVED.values()) <= _VLLM_TOTAL_SLOTS
 

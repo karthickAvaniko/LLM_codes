@@ -29,8 +29,8 @@ else
     --dtype auto \
     --max-model-len 65536 \
     --gpu-memory-utilization 0.85 \
-    --max-num-seqs 8 \
-    --max-num-batched-tokens 4096 \
+    --max-num-seqs 32 \
+    --max-num-batched-tokens 16384 \
     --trust-remote-code \
     --enable-prefix-caching \
     --enable-auto-tool-choice \
