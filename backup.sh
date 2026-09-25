@@ -5,7 +5,7 @@
 set -u
 DEST=/workspace/backups
 mkdir -p "$DEST"
-STAMP=$(date -u +%Y-%m-%d)
+STAMP=$(date +%Y-%m-%d)
 # dump the key database (restorable with: mysql avaniko < avaniko_db.sql)
 mysqldump avaniko > /workspace/gateway/avaniko_db.sql 2>/dev/null
 tar -czf "$DEST/avaniko_$STAMP.tar.gz" \
@@ -15,4 +15,4 @@ tar -czf "$DEST/avaniko_$STAMP.tar.gz" \
   embed_server.py start_all.sh backup.sh API_GUIDE.md 2>/dev/null
 # prune archives older than 14 days
 find "$DEST" -name "avaniko_*.tar.gz" -mtime +14 -delete
-echo "$(date -u) backup done: $DEST/avaniko_$STAMP.tar.gz ($(du -h "$DEST/avaniko_$STAMP.tar.gz" | cut -f1))"
+echo "$(date) backup done: $DEST/avaniko_$STAMP.tar.gz ($(du -h "$DEST/avaniko_$STAMP.tar.gz" | cut -f1))"

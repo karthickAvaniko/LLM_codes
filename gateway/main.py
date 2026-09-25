@@ -1166,7 +1166,22 @@ def _wants_json(question: str) -> bool:
 _VLLM_TOTAL_SLOTS = 30   # vLLM launched with --max-num-seqs 32 (start_all.sh);
                          # keep headroom outside this accounting for calls
                          # that bypass the scheduler (e.g. /health).
-_VLLM_RESERVED = {"CHAT": 8, "AGENT": 4, "VISION": 8, "DOCUMENT": 8}   # always-available
+#
+# VISION lowered 8->2 on 2026-09-24 after two controlled concurrency
+# benchmarks (/workspace/result_vision_concurrency/ and
+# /workspace/result_vision_concurrency_fresh/, the second using distinct
+# real invoices per request specifically to rule out prefix/mm-cache
+# warming as a confound). Per-request decode throughput (tok/s, the metric
+# that isolates real GPU-compute contention from document-length noise) was
+# flat through concurrency=2 (175.3 -> 176.4 tok/s, no measurable cost) and
+# degraded at concurrency=3 (-20.6%) and concurrency=4 (-29.3%). GPU compute
+# was pegged at 99-100% during every vision-hybrid call regardless of
+# concurrency; KV-cache usage stayed under 2.1% and vLLM's own
+# num_requests_waiting was 0 throughout both benchmarks -- so the ceiling
+# here is GPU decode-compute sharing, not admission queueing or KV-cache
+# capacity. 2 is the last concurrency level with no measured per-request
+# slowdown.
+_VLLM_RESERVED = {"CHAT": 8, "AGENT": 4, "VISION": 2, "DOCUMENT": 8}   # always-available
                                                            # minimum per class
 assert sum(_VLLM_RESERVED.values()) <= _VLLM_TOTAL_SLOTS
 

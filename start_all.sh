@@ -3,43 +3,31 @@
 # Avaniko AI Platform — start everything with persistent logs
 # Run this after a pod restart:  bash /workspace/start_all.sh
 set -u
+export TZ='Asia/Kolkata'   # all log timestamps in this file and its child processes are IST, not UTC
 LOGS=/workspace/logs
 mkdir -p "$LOGS"
 
 echo "── Avaniko AI Platform startup ──"
 
-# ── vLLM (port 7777) ─────────────────────────────────────
+# ── vLLM (port 7777, AUTO-RESTART) ───────────────────────
+# EngineCore can die outright from a CUDA "illegal memory access" inside its
+# fused kernels (hit 2026-09-21 and again 2026-09-22, two different kernels,
+# same symptom — see vllm_start.sh) while the APIServer process stays alive,
+# keeps the port open, and correctly reports 503 on /health — but nothing
+# was polling that endpoint, so the 2026-09-22 crash sat undetected for ~21
+# minutes until a human noticed. vllm_watchdog.sh actively health-checks and
+# kills/restarts on 2 consecutive failures, same pattern as
+# gateway_watchdog.sh below. The actual launch command lives in
+# vllm_start.sh so start_all.sh and the watchdog never drift apart.
 if curl -sf http://localhost:7777/health >/dev/null 2>&1; then
   echo "vLLM already running on 7777"
+elif [ -f "$LOGS/vllm_watchdog.pid" ] && kill -0 "$(cat "$LOGS/vllm_watchdog.pid" 2>/dev/null)" 2>/dev/null; then
+  echo "vLLM watchdog already running"
 else
   pkill -f "vllm.entrypoints" 2>/dev/null; sleep 3
-  # "12.0f" (family-conditional PTX) needs CUDA >=12.9 to even compile and
-  # isn't what this GPU's toolchain resolves anyway — plain "12.0" (this
-  # card's real compute capability, RTX PRO 6000 Blackwell = sm_120) is what
-  # actually builds. Needs CUDA toolkit 12.9+ on PATH (13.0 installed at
-  # /usr/local/cuda) — CUDA 12.6/12.8 both failed this model's FlashInfer/
-  # Triton kernel builds outright (nvcc/"SM 12.x requires CUDA >= 12.9").
-  export FLASHINFER_CUDA_ARCH_LIST="12.0"
-  export VLLM_USE_DEEP_GEMM=0
-  export PATH=/usr/local/cuda/bin:$PATH
-  nohup /workspace/venv/bin/python -m vllm.entrypoints.openai.api_server \
-    --model /workspace/models/Qwen3.6-35B-A3B-FP8 \
-    --served-model-name qwen3.6-35b \
-    --host 127.0.0.1 --port 7777 \
-    --dtype auto \
-    --max-model-len 65536 \
-    --gpu-memory-utilization 0.85 \
-    --max-num-seqs 32 \
-    --max-num-batched-tokens 16384 \
-    --trust-remote-code \
-    --enable-prefix-caching \
-    --enable-auto-tool-choice \
-    --tool-call-parser qwen3_coder \
-    --reasoning-parser qwen3 \
-    --kv-cache-dtype fp8_e4m3 \
-    >> "$LOGS/vllm.log" 2>&1 &
-  echo $! > "$LOGS/vllm.pid"
-  echo "vLLM starting (PID $(cat $LOGS/vllm.pid)) — model load takes ~5 min"
+  nohup bash /workspace/vllm_watchdog.sh >> /tmp/vllm_watchdog.log 2>&1 &
+  echo $! > "$LOGS/vllm_watchdog.pid"
+  echo "vLLM starting (auto-restart loop, watchdog PID $(cat $LOGS/vllm_watchdog.pid)) — model load takes ~5 min"
 fi
 
 # ── MySQL (MariaDB, datadir on persistent /workspace, AUTO-RESTART) ────
@@ -49,6 +37,19 @@ fi
 # hours until someone notices.
 if mysql -e "SELECT 1" >/dev/null 2>&1; then
   echo "MySQL already running"
+elif ss -ltn 2>/dev/null | grep -qE '[:.]3306[[:space:]]'; then
+  # Port 3306 is held by a server we cannot log into. This is the distro's
+  # mariadb.service on datadir /var/lib/mysql, which systemd auto-enables when
+  # the apt-get install below ever runs, and which then wins the race against
+  # this script on every reboot. It has none of the platform's users and no
+  # avaniko database, so the gateway dies at import with
+  #   pymysql.err.OperationalError: (1045, "Access denied for user 'avaniko'")
+  # while the watchdog loop below would respawn the real server every 3s
+  # against "Can't start server: Bind on TCP/IP port ... Address already in
+  # use" forever. Two crashloops, no recovery. Fail loudly instead.
+  echo "MySQL ERROR: port 3306 is held by a foreign server, not /workspace/mysql."
+  echo "  Cause: distro mariadb.service (datadir /var/lib/mysql) started at boot."
+  echo "  Fix  : sudo systemctl disable --now mariadb   then re-run this script."
 elif [ -f "$LOGS/mysql.pid" ] && kill -0 "$(cat "$LOGS/mysql.pid" 2>/dev/null)" 2>/dev/null; then
   echo "MySQL watchdog already running"
 else
@@ -57,14 +58,22 @@ else
     apt-get install -y -qq mariadb-server >/dev/null 2>&1 || \
       { apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq mariadb-server >/dev/null 2>&1; }
   }
-  mkdir -p /run/mysqld
+  # /run is a root-owned tmpfs, wiped on every boot, and the ubuntu user this
+  # loop runs as cannot mkdir inside it. The socket dir used to appear only as a
+  # side effect of the distro mariadb.service starting — which is precisely the
+  # service that must stay disabled, because it squats on 3306 with the wrong
+  # datadir (/var/lib/mysql) and took the whole platform down on 2026-09-21.
+  # Without this, mariadbd aborts with "Bind on unix socket: Permission denied".
+  if [ ! -d /run/mysqld ] || [ ! -w /run/mysqld ]; then
+    sudo mkdir -p /run/mysqld && sudo chown "$(id -un):$(id -gn)" /run/mysqld
+  fi
   pkill -f "mariadbd --user=root" 2>/dev/null; sleep 2
   nohup bash -c '
     while true; do
       mariadbd --user=root --datadir=/workspace/mysql --bind-address=127.0.0.1 \
         --socket=/run/mysqld/mysqld.sock \
         --wait-timeout=180 --connect-timeout=20 --innodb-lock-wait-timeout=30
-      echo "$(date -u "+%F %T") mariadbd exited — restarting in 3s"
+      echo "$(date "+%F %T") mariadbd exited — restarting in 3s"
       sleep 3
     done
   ' >> "$LOGS/mysql.log" 2>&1 &
@@ -155,6 +164,94 @@ else
   nohup bash /workspace/gateway_watchdog.sh >> /tmp/gateway_watchdog.log 2>&1 &
   echo $! > "$LOGS/gateway_watchdog.pid"
   echo "Gateway starting (auto-restart loop, watchdog PID $(cat $LOGS/gateway_watchdog.pid))"
+fi
+
+# ── Public port forward 20007 → gateway 7778 (AUTO-RESTART) ──
+# This pod has no public IP of its own: eth0 is a private /32 (192.168.100.139)
+# and the host NATs public <pod-ip>:20007 through to this container's 20007, so
+# something inside must listen there or the public endpoint simply refuses.
+# socat did that job, started by hand on 2026-09-17 06:51 — and died unnoticed,
+# exactly like cloudflared did, because nothing supervised it. Hence the loop.
+#
+# This is a plain TCP relay onto a plain-HTTP origin, so the public endpoint is
+# http://<ip>:20007, NOT https:// — there is no TLS anywhere in this path.
+# Auth is only the gateway's bearer token (/workspace/gateway/.api_key), sent
+# in clear over the public internet on this route. Prefer the Cloudflare tunnel
+# (real TLS) for anything beyond testing.
+if ss -ltn 2>/dev/null | grep -qE '[:.]20007[[:space:]]'; then
+  echo "Port forward 20007 already running"
+else
+  nohup bash -c '
+    while true; do
+      socat TCP-LISTEN:20007,fork,reuseaddr TCP:127.0.0.1:7778
+      echo "$(date "+%F %T") socat 20007 exited — restarting in 3s"
+      sleep 3
+    done
+  ' >> "$LOGS/socat_20007.log" 2>&1 &
+  echo $! > "$LOGS/socat_20007.pid"
+  echo "Port forward 20007 → 7778 started (auto-restart, PID $(cat $LOGS/socat_20007.pid))"
+fi
+
+# ── Public port forward 20006 → gateway 7778 (AUTO-RESTART) ──
+# Second public endpoint onto the same gateway, added 2026-09-22 because the
+# host also NATs <pod-ip>:20006 through to this container. Same caveats as
+# 20007 above: plain TCP relay onto a plain-HTTP origin, so the public URL is
+# http://<ip>:20006 — https:// will NOT connect, there is no TLS on this path.
+if ss -ltn 2>/dev/null | grep -qE '[:.]20006[[:space:]]'; then
+  echo "Port forward 20006 already running"
+else
+  nohup bash -c '
+    while true; do
+      socat TCP-LISTEN:20006,fork,reuseaddr TCP:127.0.0.1:7778
+      echo "$(date "+%F %T") socat 20006 exited — restarting in 3s"
+      sleep 3
+    done
+  ' >> "$LOGS/socat_20006.log" 2>&1 &
+  echo $! > "$LOGS/socat_20006.pid"
+  echo "Port forward 20006 → 7778 started (auto-restart, PID $(cat $LOGS/socat_20006.pid))"
+fi
+
+# ── Public port forward 20004 → gateway 7778 (AUTO-RESTART) ──
+# Added 2026-09-22: 20004 is the port the host actually NATs through to this
+# container (20006 was tried first and is NOT mapped — it refuses publicly).
+# Plain TCP relay onto a plain-HTTP origin, same as 20007: the public URL is
+# http://<ip>:20004 — https:// will NOT connect, there is no TLS on this path.
+if ss -ltn 2>/dev/null | grep -qE '[:.]20004[[:space:]]'; then
+  echo "Port forward 20004 already running"
+else
+  nohup bash -c '
+    while true; do
+      socat TCP-LISTEN:20004,fork,reuseaddr TCP:127.0.0.1:7778
+      echo "$(date "+%F %T") socat 20004 exited — restarting in 3s"
+      sleep 3
+    done
+  ' >> "$LOGS/socat_20004.log" 2>&1 &
+  echo $! > "$LOGS/socat_20004.pid"
+  echo "Port forward 20004 → 7778 started (auto-restart, PID $(cat $LOGS/socat_20004.pid))"
+fi
+
+# ── Internal 9999 → gateway 7778 (AUTO-RESTART) — THE LIVE PUBLIC PATH ──
+# The provider dashboard ("Exposed Services") maps internal 9999 → public
+# 50.35.188.68:20004. The dashboard side only NATs; something must LISTEN on
+# 9999 inside the pod or the public address refuses. Two outages were caused by
+# exactly this: "1111 → 20007" and "9999 → 20004" both pointed at dead internal
+# ports while the gateway was healthy on 7778 the whole time.
+#
+# Public URL is http://50.35.188.68:20004 — plain HTTP, NO TLS on this path.
+# NOTE: the provider reassigns the PUBLIC port on every pod reset, so re-check
+# the dashboard row after a restart; the internal port (9999) stays ours.
+if ss -ltn 2>/dev/null | grep -qE '[:.]9999[[:space:]]'; then
+  echo "Internal 9999 forward already running"
+else
+  nohup bash -c '
+    while true; do
+      socat TCP-LISTEN:9999,fork,reuseaddr TCP:127.0.0.1:7778
+      echo "$(date "+%F %T") socat 9999 exited — restarting in 3s"
+      sleep 3
+    done
+  ' >> "$LOGS/socat_9999.log" 2>&1 &
+  echo $! > "$LOGS/socat_9999.pid"
+  echo "Internal 9999 → 7778 started (public 20004, auto-restart, PID $(cat $LOGS/socat_9999.pid))"
 fi
 
 # ── Daily backup loop ────────────────────────────────────

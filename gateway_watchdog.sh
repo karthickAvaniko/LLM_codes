@@ -20,7 +20,7 @@ while true; do
   bash /workspace/gateway/start.sh >> "$LOCAL_LOGS/gateway.log" 2>&1 &
   GW_PID=$!
   echo "$GW_PID" > "$LOGS/gateway.pid"
-  echo "$(date -u '+%F %T') gateway started, PID $GW_PID"
+  echo "$(date '+%F %T') gateway started, PID $GW_PID"
 
   FAILS=0
   while kill -0 "$GW_PID" 2>/dev/null; do
@@ -29,9 +29,9 @@ while true; do
       FAILS=0
     else
       FAILS=$((FAILS + 1))
-      echo "$(date -u '+%F %T') health check failed ($FAILS/2)"
+      echo "$(date '+%F %T') health check failed ($FAILS/2)"
       if [ "$FAILS" -ge 2 ]; then
-        echo "$(date -u '+%F %T') gateway unresponsive — killing PID $GW_PID"
+        echo "$(date '+%F %T') gateway unresponsive — killing PID $GW_PID"
         kill -9 "$GW_PID" 2>/dev/null
         break
       fi
@@ -39,6 +39,6 @@ while true; do
   done
 
   wait "$GW_PID" 2>/dev/null
-  echo "$(date -u '+%F %T') gateway process gone — restarting in 3s"
+  echo "$(date '+%F %T') gateway process gone — restarting in 3s"
   sleep 3
 done

@@ -22,10 +22,19 @@ import requests
 # Set AVANIKO_API_KEY in your environment rather than hardcoding it here —
 # this file is committed to git, and a hardcoded key here would leak it.
 API_KEY  = os.environ.get("AVANIKO_API_KEY", "")
-BASE_URL = os.environ.get("AVANIKO_BASE_URL", "https://s2f1q59mb9tg9r-7778.proxy.runpod.net")
+# No hardcoded default here on purpose: RunPod's proxy hostname is keyed to
+# the pod ID and changes on every pod restart/recreate (confirmed stale
+# 2026-09-24 — a previously-hardcoded proxy URL 404'd against a pod that no
+# longer exists). There is only one server; get its current address from
+# the provider dashboard (or the live Cloudflare tunnel hostname once
+# DNS_MIGRATION_CHECKLIST.md is complete) and set it here each time.
+BASE_URL = os.environ.get("AVANIKO_BASE_URL", "")
 
 if not API_KEY:
     sys.exit("Set AVANIKO_API_KEY in your environment before running this script.")
+if not BASE_URL:
+    sys.exit("Set AVANIKO_BASE_URL in your environment before running this script "
+             "(the proxy/tunnel URL changes over time — check the current one first).")
 
 # ── Extraction prompt ──────────────────────────────────────
 # No fixed field list here on purpose — this stays dynamic: let the model

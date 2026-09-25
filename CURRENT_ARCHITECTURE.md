@@ -1,11 +1,14 @@
 # Avaniko AI Platform — Current Architecture
-> Last updated: 2026-08-26 | Verified against live code + live running processes (not just docs)
+> Last updated: 2026-09-24 | Verified against live code + live running processes (not just docs)
 
 > **Supersedes the architecture sections in `README.md`, `current.md`, and
 > `PRODUCTION_ARCHITECTURE_REVIEW.md`.** Those describe an old two-tier
 > `production/` + `avaniko-platform/` layout that no longer exists. The real
 > system today is the single monolith below. Treat this file as the source of
-> truth; the others are historical.
+> truth; the others are historical. This revision also supersedes the
+> 2026-08-26 version of this file — GPU hardware, the model checkpoint, the
+> vLLM launch flags, the scheduler slot counts, and the public-exposure path
+> have all changed since then.
 
 ---
 
@@ -13,250 +16,262 @@
 
 | | |
 |---|---|
-| GPU | 1× NVIDIA RTX A6000, 49,140 MiB VRAM |
-| Free VRAM (current, FP8 KV cache) | ~7.8 GB |
-| Free VRAM (before FP8 KV cache) | ~5.0 GB |
+| GPU | 1× NVIDIA RTX PRO 6000 Blackwell Server Edition, 97,249 MiB VRAM (upgraded from the original RTX A6000 48GB — see `A100_80GB_UPGRADE_SIZING_REPORT.md` for the sizing history) |
+| VRAM in use (model + reserved KV cache, `--gpu-memory-utilization 0.85`) | ~86 GB |
+| vLLM's own reported KV-cache capacity at this utilization | 4,104,426 tokens ≈ 62.6x concurrency headroom for 65,536-token requests |
 
-**One GPU, one model instance.** A single copy of Qwen3.6-35B-A3B already uses
-~43GB of the 49GB card, so there is no room for a second full model instance —
-this rules out any "true" hardware-isolated multi-instance architecture
-(e.g. separate GPU per queue type) without adding a second GPU.
+**One GPU, one model instance**, same as before — still no hardware isolation
+between request classes; isolation is done gateway-side (§5). The larger card
+means considerably more KV-cache headroom than the old A6000, which is why
+`--max-num-seqs` was raised from 8 → 32 on 2026-09-18 (confirmed against
+vLLM's own KV-cache accounting, not guessed — see §5 comment trail).
 
 ---
 
 ## 2. Process Map
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│ RunPod Pod (single container, /workspace persistent volume)       │
-│                                                                     │
-│  vLLM engine          gateway (monolith)      MySQL/MariaDB        │
-│  port 7777            port 7778               port 3306            │
-│  (no watchdog —       (watchdog auto-         (watchdog auto-      │
-│   started once by      restart, ~3s)           restart, auto-      │
-│   start_all.sh)                                 reinstall on       │
-│                                                  container reset)   │
-│                                                                     │
-│  OCR service           Embedding service                           │
-│  port 7780             port 7779                                   │
-│  (watchdog auto-       (localhost only,                            │
-│   restart —             no watchdog loop)                          │
-│   PaddleOCR segfaults)                                              │
-└──────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│ RunPod Pod (single container, /workspace persistent volume, MooseFS)  │
+│                                                                          │
+│  vLLM engine          gateway (monolith)      MySQL/MariaDB            │
+│  port 7777            port 7778               port 3306                │
+│  (watchdog, added      (watchdog auto-        (watchdog auto-          │
+│   2026-09-22 —          restart, ~30s)          restart loop; distro   │
+│   see below)                                    mariadb.service can    │
+│                                                  squat on 3306 — §2a)  │
+│                                                                          │
+│  OCR pool (4 procs)    Embedding service                                │
+│  ports 7780-7783       port 7779                                        │
+│  (watchdog per-port,   (localhost only,                                 │
+│   PaddleOCR segfaults)  no watchdog loop)                                │
+└──────────────────────────────────────────────────────────────────────┘
                               ▲
-                              │ https://<runpod-proxy>:7778
-                              │
-                        Client / SDK / dashboard
+                     see §6 for how this reaches
+                     the public internet today
 ```
 
 Everything is started/supervised by `/workspace/start_all.sh` (idempotent —
 checks each service's `/health` before starting, safe to re-run after a pod
-restart). Auto-restart loops:
+restart).
 
-- **Gateway** — `gateway_watchdog.sh` health-checks port 7778 every 15s;
-  2 consecutive failures → force-kill + restart via `gateway/start.sh`.
-  Exists because the gateway can freeze in kernel D-state on a blocked
-  `/workspace` (network-mounted MooseFS) write without ever exiting on its own.
-- **MySQL** — bash `while true` respawn loop; the network-mounted datadir has
-  crashed `mariadbd` under write load before.
-- **OCR** — bash `while true` respawn loop; PaddleOCR can segfault.
-- **vLLM — no auto-restart.** If it dies, `start_all.sh` must be re-run
-  manually (or a watchdog added — not present today).
+### vLLM now has a watchdog (changed from the 2026-08-26 revision of this doc)
+
+`vllm.entrypoints`'s **EngineCore** can die outright from a CUDA "illegal
+memory access" inside its own fused kernels — hit twice, in two different
+kernels, same symptom:
+- **2026-09-21 09:02:29** — MoE shared-experts auxiliary CUDA stream
+  (`shared_experts.py maybe_forward_async/wait`). Worked around by
+  `VLLM_DISABLE_SHARED_EXPERTS_STREAM=1` in `vllm_start.sh` (forces the
+  single-stream path, costs a little decode overlap).
+- **2026-09-22 06:16:45** — GDN attention kernel. Different code path, **not**
+  covered by the flag above — this class of crash can't be eliminated
+  outright, only recovered from quickly.
+
+When EngineCore dies, the APIServer process **stays alive**, keeps port 7777
+open, and correctly answers `/health` with 503 — but nothing was polling that
+endpoint, so the 2026-09-22 crash sat undetected for **~21 minutes** until a
+human noticed. `vllm_watchdog.sh` closes that gap: polls `/health` every 15s,
+kills + restarts on 2 consecutive failures, same pattern as
+`gateway_watchdog.sh`. Two extra things it handles that a naive restart loop
+wouldn't:
+- **Adopts** an already-healthy vLLM on first start instead of restarting it
+  (tracked via `logs/vllm.pid`), so installing the watchdog itself never
+  causes an outage.
+- Sweeps **`VLLM::` process names**, not just `vllm.entrypoints` — the
+  EngineCore worker is a separate multiprocessing child that renames itself
+  and doesn't match the parent's cmdline pattern. Confirmed live on
+  2026-09-22: an orphaned EngineCore held the full GPU memory reservation and
+  blocked every subsequent launch with "Engine core initialization failed"
+  until killed by name.
+
+The actual launch command lives in `vllm_start.sh` (not inlined in
+`start_all.sh`) specifically so the one-shot boot path and the watchdog's
+restart path can never drift apart.
+
+### 2a. MySQL — new failure mode since 2026-08-26
+
+The distro's `mariadb.service` (datadir `/var/lib/mysql`) auto-enables itself
+whenever `apt-get install mariadb-server` runs (e.g. after a container reset)
+and wins the race for port 3306 on every reboot. It has none of the
+platform's users/database, so the gateway fails at import with
+`pymysql.err.OperationalError: (1045, "Access denied for user 'avaniko'")`,
+while `start_all.sh`'s respawn loop would otherwise crash-loop the *real*
+server against "Address already in use" forever. `start_all.sh` now detects
+this (port held but `mysql -e "SELECT 1"` fails) and fails loudly with the
+fix instead of crash-looping: `sudo systemctl disable --now mariadb`.
+
+- **OCR** — unchanged in shape (bash `while true` respawn loop per port;
+  PaddleOCR can segfault) but now **4 isolated processes**, ports
+  7780–7783, each pinned to `OMP/OPENBLAS/MKL/PADDLE_PDX_CPU_NUM_THREADS=2`
+  (benchmarked, not assumed — 2 threads beat 1 at every concurrency level
+  tested). Requires `paddlepaddle==3.0.0` exactly; 3.3.1 crashes every real
+  OCR request with a PIR/oneDNN executor bug.
+- **Gateway** — unchanged: `gateway_watchdog.sh` health-checks port 7778
+  every 15s, kills + restarts on 2 consecutive failures. Still `--workers 1`
+  (see §9 — the 2026-08-10 524 incident's recommendation to raise this was
+  never applied).
 
 ---
 
 ## 3. The Gateway Is One File
 
-`/workspace/gateway/main.py` — a single monolith, ~189KB, all routes and
-business logic in one process (`uvicorn main:app --workers 1`). There is no
-`routers/` package in active use (a `gateway/app/routers/` directory exists
-but is not what's wired into the running app — `main.py` defines every route
-directly). `/workspace/production/` (the old separate FastAPI app with
-`routers/`, `services/`, etc. described in the stale docs) is legacy and not
-what's running.
+`/workspace/gateway/main.py` — a single monolith, now **4,221 lines**, all
+routes and business logic in one process (`uvicorn main:app --workers 1`).
+`gateway/app/routers/` still exists and is still **not** wired into the
+running app (dead code, unchanged open item from before).
 
-### Key endpoints (from `main.py`)
-
-| Endpoint | Purpose |
-|---|---|
-| `POST /v1/chat/completions` | OpenAI-compatible chat (streaming + non-streaming, tool-calling) |
-| `POST /v1/extract` | Invoice/document → structured JSON |
-| `POST /v1/ask` | Q&A over an uploaded document |
-| `POST /v1/files`, `GET /v1/files/{fid}`, `DELETE /v1/files/{fid}` | File upload/management |
-| `POST /v1/files/{fid}/ask` | Ask a question against a specific stored file |
-| `GET /v1/models`, `GET /v1/usage` | Model list, usage stats |
-| `POST /auth/register`, `/auth/login`, `/auth/logout`, `/auth/signin`, `/auth/admin-login` | Auth |
-| `GET/POST /admin-api/users`, `/admin-api/keys*` | Admin user/key management |
-| `GET /admin/keys`, `/admin/keys/{id}/enable` | Legacy admin key endpoints |
-| `POST /getkey`, `/signup/key` | Self-serve API key issuance |
-| `GET /health` | Gateway + vLLM health |
-| `GET /chat` | Built-in dev chat UI |
-| `POST /files/ask` | Legacy streaming file-ask endpoint |
+Key endpoints are unchanged from the 2026-08-26 revision (`/v1/chat/completions`,
+`/v1/extract`, `/v1/ask`, `/v1/files*`, auth, admin, `/getkey`, `/health`,
+`/chat` dev UI). New since then: an **admin console "System" dashboard**
+(live process/queue/GPU status tab in `gateway/static/admin_console.html`,
+restyled as a HUD) and an inline onboarding flow in the chat UI replacing
+native `prompt()`/`alert()` dialogs — both UI-only, no new API surface.
 
 ---
 
 ## 4. Model Serving (vLLM)
 
-Launched by `start_all.sh` (persisted there so it survives pod restarts):
+Launched via `vllm_start.sh` (shared by `start_all.sh` and `vllm_watchdog.sh`):
 
 ```
+FLASHINFER_CUDA_ARCH_LIST=12.0 \
+VLLM_USE_DEEP_GEMM=0 \
+VLLM_DISABLE_SHARED_EXPERTS_STREAM=1 \
 python -m vllm.entrypoints.openai.api_server \
-  --model /workspace/models/Qwen3.6-35B-A3B-GPTQ-Int4 \
+  --model /workspace/models/Qwen3.6-35B-A3B-FP8 \
   --served-model-name qwen3.6-35b \
   --host 127.0.0.1 --port 7777 \
-  --dtype float16 \
+  --dtype auto \
   --max-model-len 65536 \
   --gpu-memory-utilization 0.85 \
-  --max-num-seqs 8 \
-  --max-num-batched-tokens 4096 \
+  --max-num-seqs 32 \
+  --max-num-batched-tokens 32768 \
   --trust-remote-code \
   --enable-prefix-caching \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder \
+  --reasoning-parser qwen3 \
   --kv-cache-dtype fp8_e4m3
 ```
 
-| Setting | Value | Notes |
+| Setting | Value | Change from 2026-08-26 |
 |---|---|---|
-| Model | Qwen3.6-35B-A3B, GPTQ-Int4 weights | Hybrid architecture — has recurrent Mamba/GDN layers, not pure attention |
-| Public alias | `avaniko-1` (gateway) / `qwen3.6-35b` (vLLM's own name) | |
-| Max context | 65,536 tokens | |
-| Max concurrent sequences | 8 (vLLM) | Gateway scheduler caps its own admission at 7, see §5 |
-| KV cache dtype | **fp8_e4m3** (as of 2026-08-26) | Was float16 (implicit `auto`) before today |
-| KV cache scales | **Fixed 1.0**, not calibrated | `--calculate-kv-scales` is deprecated in vLLM 0.19.1 **and** vLLM auto-disables it for this model regardless — hybrid Mamba models can't run a reliable calibration pass because recurrent state is uninitialized during it. So this is effectively the same as vLLM's plain `fp8` auto/dynamic-scale mode, not true calibrated scales. |
-| Prefix caching | Enabled | vLLM's automatic KV-block reuse across requests sharing a prompt prefix |
-| vLLM version | 0.19.1 | |
+| Model checkpoint | **`Qwen3.6-35B-A3B-FP8`** | Was `-GPTQ-Int4`. Weights format changed. |
+| `--max-num-seqs` | **32** | Was 8. Raised 2026-09-18 after checking vLLM's actual KV-cache accounting (~62.6x headroom at 65,536 tokens/request on the new GPU), not guessed. |
+| `--max-num-batched-tokens` | **32768** | Was 4096, then found to be 16384 in prod on 2026-09-19 and diagnosed as a prefill-scheduling bottleneck (see `SLOWNESS_INVESTIGATION_2026-09-19.md`) causing 40–112s latency on large-prompt (SQL/analytics) requests; raised to 32768. |
+| `--reasoning-parser qwen3` | added | New flag, not present before. |
+| `VLLM_DISABLE_SHARED_EXPERTS_STREAM=1` | added | Workaround for the 2026-09-21 EngineCore crash (§2). |
+| `FLASHINFER_CUDA_ARCH_LIST=12.0` | added | This GPU is Blackwell (sm_120); needs CUDA toolkit ≥12.9 on PATH and this exact arch string (not `"12.0f"`) to build FlashInfer/Triton kernels. |
+| KV cache dtype | fp8_e4m3, fixed scale 1.0 | Unchanged — still not calibrated; same hybrid-Mamba limitation as before. |
+| vLLM version | 0.19.1 (unverified this revision — re-check if upgraded) | |
 
-**Why FP8 KV cache:** halves the per-token KV cache memory footprint, freeing
-VRAM (roughly 5GB → 7.8GB free) without touching model weights (already
-Int4-quantized separately). Frees headroom for more concurrent sequences /
-longer effective context / safety margin — does **not** free enough VRAM for
-a second model instance.
-
-**Known rough edges hit getting this running** (for the next person who touches
-these flags):
-- Needs `ninja` on `PATH` for a one-time JIT kernel compile (flashinfer batch-prefill
-  module) — symlinked `/workspace/venv/bin/ninja` → `/usr/local/bin/ninja`.
-- This model's hybrid Mamba/attention layers force `block_size=2096`
-  under FP8 KV cache ("Mamba cache align mode"), which is incompatible with
-  the scheduler default `max_num_batched_tokens=2048` — must be raised
-  (currently `4096`) or the engine fails an assertion at startup.
+**Known rough edge (new):** CUDA 12.6/12.8 both failed this model's
+FlashInfer/Triton kernel builds outright on the new GPU
+(`nvcc`/"SM 12.x requires CUDA >= 12.9"); needs CUDA 12.9+ toolchain on PATH
+even though the driver reports CUDA 13.0.
 
 ---
 
-## 5. Request Scheduling — Soft Priority Queues
+## 5. Request Scheduling — Soft Priority Queues (now 4 classes)
 
-Since there's only one GPU and only one vLLM engine (no room for hardware
-isolation — see §1), request-type isolation is implemented as **gateway-side
-admission control**, not separate KV cache pools. The KV cache itself stays
-one shared pool inside vLLM; this only decides which class of request gets
-the next available concurrency slot.
-
-Added 2026-08-26 in `gateway/main.py` (~line 826), class `_VLLMScheduler`:
+Same admission-control design as before (`_VLLMScheduler` in
+`gateway/main.py`, ~line 1137) — still gateway-side only, still not
+preemptive, still one shared KV-cache pool. Two changes since 2026-08-26:
 
 ```python
-_VLLM_TOTAL_SLOTS = 7   # vLLM has --max-num-seqs 8; 1 slot headroom
-_VLLM_RESERVED = {"CHAT": 2, "AGENT": 1, "DOCUMENT": 0}
+_VLLM_TOTAL_SLOTS = 30   # vLLM launched with --max-num-seqs 32; keeps
+                         # headroom outside this accounting for calls that
+                         # bypass the scheduler (e.g. /health)
+_VLLM_RESERVED = {"CHAT": 8, "AGENT": 4, "VISION": 8, "DOCUMENT": 8}
 ```
 
-- **CHAT** always has 2 slots it can claim immediately, even if DOCUMENT jobs
-  are using everything else.
-- **AGENT** (tool-calling chat requests) always has 1.
-- **DOCUMENT** (extraction, map-reduce chunk calls, RAG) has no reserved
-  minimum — it gets whatever's left, and yields newly-freed slots to
-  CHAT/AGENT first if either is below its reserved minimum.
-- **Not preemptive** — a request already generating can't be interrupted from
-  outside vLLM. This only gates admission of new requests.
-
-Every outgoing call to `VLLM_URL` (`http://localhost:7777`) goes through
-`_vllm_sched.slot(queue_class)`. Call sites and their class:
+1. **Total slots raised 30** (was 7), matching the `--max-num-seqs 8→32` GPU
+   upgrade above.
+2. **New `VISION` class**, added 2026-09-18 after a real incident: a single
+   user firing 10 concurrent image/vision-hybrid extraction calls drove
+   "Running" sequences to 5 and stalled *other users'* plain-text DOCUMENT
+   requests for 17–77s — heavy multimodal prefill was crowding out cheap
+   text calls with no isolation between them. VISION now gets its own
+   reserved ceiling so an image burst can't eat DOCUMENT's (or anyone
+   else's) slots. Reservations now **sum to exactly the total** (a strict
+   partition, not a soft minimum).
 
 | Function / endpoint | Queue class |
 |---|---|
-| `_llm()`, `_llm_retry_truncation()`, `_llm_sse()` (extraction, map-reduce, self-correct, RAG-ask) | `DOCUMENT` (default) |
-| `_vllm_post()` | `CHAT` (default) |
-| `_needs_web()`, `_detect_task()` (inline chat classifiers) | `CHAT` |
+| `_llm()`, `_llm_retry_truncation()`, `_llm_sse()` (text-only extraction, map-reduce, self-correct, RAG-ask) | `DOCUMENT` |
+| Any extract/ask call carrying images (≤`MAX_VISION_PAGES` = 10, native-vision hybrid path) | `VISION` |
+| `_vllm_post()`, `_needs_web()`, `_detect_task()`, `/chat` dev UI | `CHAT` |
 | `chat_completions()` | `AGENT` if request has `tools`/`tool_choice`, else `CHAT` |
-| `/chat` (built-in dev UI) | `CHAT` |
 | `/files/ask` (legacy streaming path) | `DOCUMENT` |
 
 Full changelog: `/workspace/GATEWAY_QUEUE_ISOLATION_CHANGES.md`.
 
 ---
 
-## 6. Request Flow — How Many LLM Calls Per Request
+## 6. Public Exposure — messier than 2026-08-26, now multiple layers
 
-(Full detail: `/workspace/LLM_CALL_FLOW_AND_INVOICE_ARCHITECTURE_REPORT.md`)
+This pod still has **no public IP of its own** (`eth0` is a private
+`/32`, `192.168.100.139`); the provider NATs a public `<ip>:<port>` onto one
+internal port. Since the last revision of this doc, that internal port has
+moved more than once and `start_all.sh` now runs **four separate plain-TCP
+`socat` relays**, not one, because outages kept being caused by the dashboard
+side changing without the pod side following:
 
-**Single chat message:** usually **1–3 LLM calls** —
-1. Optional: `_detect_task()` — cheap classifier call to pick a
-   temperature/thinking preset (skipped for inline-image chat, which forces
-   extraction mode directly).
-2. Optional: `_needs_web()` — cheap classifier call to decide if live web
-   context should be pulled in.
-3. The real answer call.
+| Relay | Status |
+|---|---|
+| `9999 → 7778` | **The live public path today** — provider's "Exposed Services" dashboard maps this to public `50.35.188.68:20004`. |
+| `20004 → 7778` | Added 2026-09-22 after discovering the host actually NATs through 20004, not 20006. |
+| `20006 → 7778` | Tried first on 2026-09-22, found **not** mapped publicly (refuses). Left running, currently dead weight. |
+| `20007 → 7778` | Original relay from 2026-09-17; superseded, likely dead weight now too. |
 
-No server-side agentic loop — if the client sends `tools`, the request is
-passed through to vLLM's own tool-calling (`--enable-auto-tool-choice`,
-`qwen3_coder` parser) and the class is `AGENT`, but the gateway isn't running
-its own multi-step agent loop on top of that.
+**All of these are plain HTTP with no TLS anywhere in the path** — auth is
+only the gateway's own bearer token, sent in clear over the public internet.
+The provider **reassigns the public port on every pod reset**, so the
+dashboard row must be re-checked after any restart — this exact failure mode
+(internal port healthy, public mapping pointing at a dead port) caused two
+prior outages (`1111→20007`, then `9999→20004` itself once).
 
-**Invoice/document → JSON (`POST /v1/extract`):** 1 client HTTP call.
-Internally, **typically 1 LLM call** for a normal-sized document
-(single-pass or vision-hybrid). Multiplies only when:
-- the document is too large → map-reduce (1 call per chunk + reduce call(s)),
-- `consistency > N` is requested → +N−1 cheap voting calls,
-- deterministic validation fails → +1 self-correction retry.
-
-Worst case ≈ `chunks + reduces + consistency_votes + 1`.
-
----
-
-## 7. Auth / Secrets
-
-- App-level auth: `x-api-key` header (own scheme) — `Authorization: Bearer`
-  is also accepted at `/v1/chat/completions` for OpenAI SDK compatibility.
-- JWT for the dashboard/admin login flows (`/auth/login`, `/auth/register`).
-- Secrets live in `/workspace/.env` (`API_KEY`, `JWT_SECRET`) and
-  `/workspace/.s3_env` (AWS creds for S3 backup push) — both are
-  `chmod 600` and gitignored (`.s3_env` was added to `.gitignore`
-  2026-08-26; previously only `*.env`-suffixed files were covered and
-  `.s3_env` slipped through that pattern, though it was never actually
-  committed).
-- **Open item:** the AWS key in `.s3_env` is flagged in its own comment as
-  already exposed in a chat transcript (2026-06-24) and needs rotation in
-  the AWS IAM console — this environment has no AWS credentials configured
-  to do that rotation programmatically, so it's still pending manual action.
+**In progress, not yet live:** `DNS_MIGRATION_CHECKLIST.md` (captured
+2026-09-21) — moving `avaniko.com` DNS from GoDaddy to Cloudflare so a
+**Cloudflare Tunnel** can serve `llm.avaniko.com` with real TLS, replacing
+the socat relays above. `api.avaniko.com` (Azure/IIS, unrelated service)
+stays where it is. Current state verified this revision: `cloudflared`
+binary is installed (`/usr/local/bin/cloudflared`) and `~/.cloudflared/`
+exists, but **no tunnel config/credentials have been created yet** — the
+"Then (on the pod, I run these)" steps in the checklist are still pending.
 
 ---
 
-## 8. File Reference
+## 7. Request Flow — How Many LLM Calls Per Request
 
-```
-/workspace/
-├── .env                 ← gateway API_KEY, JWT_SECRET
-├── .s3_env               ← AWS creds for S3 backup (chmod 600, gitignored, key needs rotation)
-├── start_all.sh          ← starts/supervises everything, idempotent, run after pod restart
-├── gateway_watchdog.sh   ← health-checks + force-restarts the gateway
-├── invoice_to_json.py    ← client-side script that calls /v1/extract
-├── ocr_server.py         ← PaddleOCR service (port 7780)
-├── embed_server.py       ← embedding service (port 7779)
-│
-├── gateway/               ← ✅ LIVE — the real production app
-│   └── main.py            ← the monolith: every route, the vLLM scheduler, auth, everything
-│
-├── production/            ← ⚠️ LEGACY — old separate FastAPI app, not what's running
-├── avaniko-platform/      ← ⚠️ LEGACY — old two-tier public API layer, never deployed, likely stale
-│
-├── models/Qwen3.6-35B-A3B-GPTQ-Int4/   ← model weights served by vLLM
-│
-├── CURRENT_ARCHITECTURE.md                              ← this file
-├── GATEWAY_QUEUE_ISOLATION_CHANGES.md                    ← priority-queue scheduler changelog
-├── LLM_CALL_FLOW_AND_INVOICE_ARCHITECTURE_REPORT.md      ← full call-flow trace, chat + extract
-├── EXTRACT_VISION_OCR_PIPELINE.md                        ← OCR/vision pipeline detail (dated, verify against code)
-├── README.md, current.md, PRODUCTION_ARCHITECTURE_REVIEW.md, AVANIKO_FULL_REPORT.md
-│                                                          ← ⚠️ STALE — describe the old two-tier layout, kept for history only
-```
+Unchanged from the 2026-08-26 revision — see
+`LLM_CALL_FLOW_AND_INVOICE_ARCHITECTURE_REPORT.md` for full detail. No
+server-side agentic loop; 1–3 calls per chat message; extraction is
+typically 1 call, multiplying only for map-reduce/consistency/self-correction.
+
+---
+
+## 8. Auth / Secrets
+
+- Same scheme as before (`x-api-key` / `Authorization: Bearer`, JWT for
+  dashboard login, secrets in `/workspace/.env` and `/workspace/.s3_env`,
+  both `chmod 600` and gitignored).
+- **Web-search bug from `SLOWNESS_INVESTIGATION_2026-09-19.md` is now fixed
+  at the dependency level** — `ddgs` (9.16.0) is installed in the gateway
+  venv. Note: the `from ddgs import DDGS` import in `_web_search_sync()` is
+  still *outside* the function's `try/except` (only the search call itself
+  is wrapped), so this would silently reopen as an unhandled 500 if the
+  dependency were ever removed again — low priority given it's installed
+  now, but worth moving inside the `try` while touching that function.
+- **Not fixed:** `gateway/main.py` still hardcodes
+  `ADMIN_LOGIN_PASS = os.environ.get("AVANIKO_ADMIN_PASS", "Avan@123")` —
+  same open item flagged in both the 2026-08-26 revision of this doc and
+  `SLOWNESS_INVESTIGATION_2026-09-19.md`. Confirm the env var is actually
+  set in production and remove the hardcoded fallback.
+- **AWS key rotation** (`.s3_env`, flagged exposed in a chat transcript on
+  2026-06-24) — status not re-verified this revision; treat as still
+  pending unless confirmed otherwise.
 
 ---
 
@@ -264,7 +279,45 @@ Worst case ≈ `chunks + reduces + consistency_votes + 1`.
 
 | Priority | Issue | Action needed |
 |---|---|---|
-| 🔴 HIGH | AWS key in `.s3_env` was exposed in a chat transcript (2026-06-24) | Rotate in AWS IAM console — needs a human with AWS access, not doable from this environment |
-| 🟡 MED | vLLM has no auto-restart watchdog (unlike gateway/MySQL/OCR) | If it dies, requires manually re-running `start_all.sh` |
-| 🟡 MED | `gateway/app/routers/` package exists but isn't wired into the running app | Either wire it up or remove it — currently dead code sitting next to the real monolith, confusing for anyone reading the repo |
-| 🟢 LOW | `README.md` / `current.md` / `PRODUCTION_ARCHITECTURE_REVIEW.md` describe a two-tier layout that no longer exists | Should be updated or archived so they stop misleading readers |
+| 🔴 HIGH | Public exposure is plain HTTP (no TLS) with the provider silently reassigning the public port on pod reset | Finish the Cloudflare Tunnel migration in `DNS_MIGRATION_CHECKLIST.md` (binary installed, tunnel not yet configured) |
+| 🔴 HIGH | Hardcoded admin password fallback (`Avan@123`) still in `gateway/main.py` | Confirm `AVANIKO_ADMIN_PASS` is set in prod; remove the fallback |
+| 🟡 MED | AWS key in `.s3_env` flagged exposed 2026-06-24 | Rotate in AWS IAM console — needs a human with AWS access |
+| 🟡 MED | Gateway still `--workers 1` | The 2026-08-10 524 incident and the 2026-09-19 slowness report both recommend `--workers 2+` so one stuck request can't freeze the whole service; still not applied |
+| 🟡 MED | Two of the four public socat relays (20006, 20007) are likely dead weight | Verify which port the provider actually NATs today and prune the unused relays to reduce confusion |
+| 🟡 MED | `gateway/app/routers/` package still dead code next to the real monolith | Wire it up or remove it |
+| 🟢 LOW | `requests.jsonl` / `vllm.log` still live on the network-mounted (MooseFS) `/workspace/logs` — the root cause class of the Aug 10 outage | Gateway's own app log already moved to `/tmp`; consider moving these too |
+| 🟢 LOW | `README.md` / `current.md` / `PRODUCTION_ARCHITECTURE_REVIEW.md` still describe the old two-tier layout | Should be updated or archived |
+
+---
+
+## 10. File Reference
+
+```
+/workspace/
+├── .env                   ← gateway API_KEY, JWT_SECRET
+├── .s3_env                ← AWS creds for S3 backup (chmod 600, gitignored, key needs rotation)
+├── start_all.sh            ← starts/supervises everything, idempotent, run after pod restart
+├── vllm_start.sh            ← single-attempt vLLM launch command (shared by start_all.sh + watchdog)
+├── vllm_watchdog.sh         ← NEW — health-checks + force-restarts vLLM (added 2026-09-22)
+├── gateway_watchdog.sh      ← health-checks + force-restarts the gateway
+├── invoice_to_json.py       ← client-side script that calls /v1/extract
+├── ocr_server.py            ← PaddleOCR service (ports 7780-7783, 4-instance pool)
+├── embed_server.py          ← embedding service (port 7779)
+│
+├── gateway/                 ← ✅ LIVE — the real production app
+│   └── main.py              ← the monolith: every route, the vLLM scheduler (4 classes), auth, everything
+│
+├── production/              ← ⚠️ LEGACY — old separate FastAPI app, not what's running
+├── avaniko-platform/        ← ⚠️ LEGACY — old two-tier public API layer, never deployed, likely stale
+│
+├── models/Qwen3.6-35B-A3B-FP8/   ← model weights served by vLLM (changed from -GPTQ-Int4)
+│
+├── CURRENT_ARCHITECTURE.md                              ← this file
+├── DNS_MIGRATION_CHECKLIST.md                            ← NEW — Cloudflare Tunnel migration plan, in progress
+├── SLOWNESS_INVESTIGATION_2026-09-19.md                  ← NEW — prefill-scheduling bottleneck + ddgs bug
+├── GATEWAY_QUEUE_ISOLATION_CHANGES.md                    ← priority-queue scheduler changelog
+├── LLM_CALL_FLOW_AND_INVOICE_ARCHITECTURE_REPORT.md      ← full call-flow trace, chat + extract
+├── EXTRACT_VISION_OCR_PIPELINE.md                        ← OCR/vision pipeline detail (dated, verify against code)
+├── README.md, current.md, PRODUCTION_ARCHITECTURE_REVIEW.md, AVANIKO_FULL_REPORT.md
+│                                                          ← ⚠️ STALE — describe the old two-tier layout, kept for history only
+```
