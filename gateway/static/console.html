@@ -653,7 +653,7 @@ function keysTable(keys){
   if(!keys.length)return h+`<tbody><tr><td colspan="11"><div class="empty">No keys yet.</div></td></tr></tbody>`;
   return h+'<tbody>'+keys.map(x=>`<tr><td><code>${x.id||'—'}</code></td><td>${esc(x.name)}</td>
     <td>${esc(x.email)||'—'}</td>
-    <td>${x.key?`<code style="cursor:pointer" title="Click to copy full key" onclick="copyText('${esc(x.key)}')">${esc(maskKey(x.key))}</code>`:'<span style="color:var(--muted)">—</span>'}</td>
+    <td>${x.key?`<span style="display:flex;align-items:center;gap:6px"><code style="cursor:pointer" title="Click to copy full key" onclick="copyText('${esc(x.key)}')">${esc(maskKey(x.key))}</code><button class="btn ghost" onclick="copyText('${esc(x.key)}')">Copy</button></span>`:'<span style="color:var(--muted)">—</span>'}</td>
     <td><span class="badge ${x.active?'on':'off'}">${x.active?'active':'revoked'}</span></td>
     <td><label class="switch"><input type="checkbox" ${x.thinking?'checked':''} onchange="setThinking('${x.id}',this.checked)"/><span class="sl"></span></label></td>
     <td><label class="switch"><input type="checkbox" ${x.ocr_enabled?'checked':''} onchange="setOcr('${x.id}',this.checked)"/><span class="sl"></span></label></td>
