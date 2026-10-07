@@ -2599,6 +2599,17 @@ def _has_vendor_field(data, depth: int = 2) -> bool:
 _INVOICE_NO_RE = re.compile(
     r"invoice\s*(?:no\.?|number|#)\s*[:\-]?\s*([A-Za-z0-9\-\/]{3,20})", re.IGNORECASE)
 
+# A bare "2 letters immediately followed by 5 (or 5+4) digits" is the exact
+# shape of a US state abbreviation glued to its ZIP code (e.g. "PA18343") —
+# virtually never a real invoice number. OCR flattens a 2D layout to linear
+# text, and a header that places the vendor's address beside the invoice-
+# number block (common letterhead layout) can land _INVOICE_NO_RE's nearest
+# "invoice ... #/no/number" match on an address fragment instead of the real
+# labeled value, especially when OCR drops the space between the state code
+# and ZIP. Checked by SHAPE, not any specific state/ZIP value, so this
+# generalizes across invoices/layouts instead of hardcoding one case.
+_LOOKS_LIKE_STATE_ZIP_RE = re.compile(r"^[A-Za-z]{2}\d{5}(-\d{4})?$")
+
 def _flatten_values(data) -> list:
     """All leaf string/number values anywhere in a nested dict/list — used to
     check whether a known-important raw value shows up ANYWHERE in the
@@ -3035,12 +3046,43 @@ def validate_extraction(data, ocr_text: str = "", raw_answer: str = "") -> dict:
     # in the source text ("Invoice No.: INV91679") that doesn't show up
     # anywhere in the output. Checked by VALUE, not by key name, since the
     # model's key for this concept varies (invoice_number / invoice_no / #).
+    #
+    # .search() alone always takes the FIRST "invoice ... no/number/#" match
+    # in the flattened OCR text — if a letterhead places the vendor address
+    # next to the invoice-number block, OCR reading order can put an address
+    # fragment (e.g. a glued state+ZIP) ahead of the real labeled value in
+    # that linear text. finditer() + preferring a candidate that isn't
+    # ZIP-shaped (_LOOKS_LIKE_STATE_ZIP_RE) fixes that without hardcoding any
+    # specific value, falling back to the first match (old behavior) when
+    # every candidate happens to look ZIP-shaped or there's only one match.
     if ocr_text:
-        m = _INVOICE_NO_RE.search(ocr_text)
-        if m and not _value_present(data, m.group(1)):
-            issues.append({"type": "invoice_number_missing", "severity": "hard",
-                           "detail": f"The document's invoice number ({m.group(1)!r}) does not "
-                                     f"appear anywhere in the extracted JSON."})
+        candidates = [mm.group(1) for mm in _INVOICE_NO_RE.finditer(ocr_text)]
+        non_zip_shaped = [c for c in candidates if not _LOOKS_LIKE_STATE_ZIP_RE.match(c)]
+        candidate = non_zip_shaped[0] if non_zip_shaped else (candidates[0] if candidates else None)
+        if candidate and not _value_present(data, candidate):
+            # Phrased as something to verify, not an asserted fact: even with
+            # the shape filter above, this heuristic has no real layout
+            # understanding, and a wrong forced assertion here previously
+            # caused the model to overwrite a correct extraction with a
+            # vendor ZIP code it had already read correctly from the image.
+            # The model (which can see the page image, for vision_hybrid
+            # calls) is the one actually positioned to tell an invoice
+            # number apart from a PO/account/reference/ZIP/phone number —
+            # see the "Primary invoice number" extraction rule above.
+            if _LOOKS_LIKE_STATE_ZIP_RE.match(candidate):
+                detail = (f"The text near an 'Invoice No./Number/#' label contains {candidate!r}, which "
+                          f"has the exact shape of a US state abbreviation + ZIP code and doesn't appear "
+                          f"anywhere in the extracted JSON. This is very likely a vendor/customer address "
+                          f"ZIP code picked up by mistake, not the real invoice number — re-check the "
+                          f"document (and page image) for the value actually labeled as the invoice "
+                          f"number, and only use {candidate!r} if you can confirm it's genuinely that, "
+                          f"never a PO/account/reference/ZIP/phone number.")
+            else:
+                detail = (f"The document's invoice number ({candidate!r}) does not appear anywhere in "
+                          f"the extracted JSON — verify against the document (and page image) and add it "
+                          f"as invoice_number only if it's genuinely the value labeled 'Invoice No.'/"
+                          f"'Invoice Number'/'Invoice #', never a PO/account/reference/ZIP/phone number.")
+            issues.append({"type": "invoice_number_missing", "severity": "hard", "detail": detail})
 
     # 8. invoice_date_out_of_range (hard) — a same-class check as wrong_amount/
     # wrong_column: not "is a date missing" (that's #already covered above),
