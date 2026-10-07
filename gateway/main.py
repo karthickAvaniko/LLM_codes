@@ -2615,10 +2615,18 @@ def _flatten_values(data) -> list:
     return out
 
 def _value_present(data, candidate: str) -> bool:
-    needle = candidate.strip().lower()
+    """Whitespace-insensitive: OCR text commonly drops/adds spaces inside a
+    code (e.g. an address's "PA 18343" flattens to "PA18343" in the raw OCR
+    stream that heuristics like _INVOICE_NO_RE scan), while a vision model
+    reading the actual image writes the same value correctly spaced. Without
+    collapsing whitespace on both sides, a value that's genuinely already in
+    the output gets reported as "missing" purely over a formatting mismatch
+    — which forces a correction pass that then duplicates/misfiles that
+    value under the wrong field (e.g. a zip code injected as invoice_number)."""
+    needle = re.sub(r"\s+", "", candidate.strip().lower())
     if not needle:
         return True
-    return any(needle in str(v).strip().lower() for v in _flatten_values(data))
+    return any(needle in re.sub(r"\s+", "", str(v).strip().lower()) for v in _flatten_values(data))
 
 def _try_json(text: str):
     try:
