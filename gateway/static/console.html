@@ -647,16 +647,23 @@ async function setOcr(id,on){
   if(d.id)toast('OCR '+(on?'ON':'OFF')+' — '+id);else toast(d.error?.message||'Failed');
   loadAll();
 }
-// admin-only: every key, with its owner, a copyable key box and thinking/OCR toggles
+async function setIsolatedQueue(id, on){
+  const d = await api('POST', '/admin-api/keys/'+id+'/isolated-queue', {isolated_queue: on});
+  if(d.id) toast('Isolated pipeline '+(on?'ON':'OFF')+' — '+id);
+  else toast(d.error?.message || 'Failed');
+  loadAll();
+}
+// admin-only: every key, with its owner, a copyable key box and thinking/OCR/isolated toggles
 function keysTable(keys){
-  const h=`<thead><tr><th>ID</th><th>Name</th><th>Owner</th><th>Key</th><th>Status</th><th>Thinking</th><th>OCR</th><th>Requests</th><th>Tokens in/out</th><th>Last used</th><th></th></tr></thead>`;
-  if(!keys.length)return h+`<tbody><tr><td colspan="11"><div class="empty">No keys yet.</div></td></tr></tbody>`;
+  const h=`<thead><tr><th>ID</th><th>Name</th><th>Owner</th><th>Key</th><th>Status</th><th>Thinking</th><th>OCR</th><th>Isolated</th><th>Requests</th><th>Tokens in/out</th><th>Last used</th><th></th></tr></thead>`;
+  if(!keys.length)return h+`<tbody><tr><td colspan="12"><div class="empty">No keys yet.</div></td></tr></tbody>`;
   return h+'<tbody>'+keys.map(x=>`<tr><td><code>${x.id||'—'}</code></td><td>${esc(x.name)}</td>
     <td>${esc(x.email)||'—'}</td>
     <td>${x.key?`<span style="display:flex;align-items:center;gap:6px"><code style="cursor:pointer" title="Click to copy full key" onclick="copyText('${esc(x.key)}')">${esc(maskKey(x.key))}</code><button class="btn ghost" onclick="copyText('${esc(x.key)}')">Copy</button></span>`:'<span style="color:var(--muted)">—</span>'}</td>
     <td><span class="badge ${x.active?'on':'off'}">${x.active?'active':'revoked'}</span></td>
     <td><label class="switch"><input type="checkbox" ${x.thinking?'checked':''} onchange="setThinking('${x.id}',this.checked)"/><span class="sl"></span></label></td>
     <td><label class="switch"><input type="checkbox" ${x.ocr_enabled?'checked':''} onchange="setOcr('${x.id}',this.checked)"/><span class="sl"></span></label></td>
+    <td><label class="switch"><input type="checkbox" ${x.isolated_queue?'checked':''} onchange="setIsolatedQueue('${x.id}',this.checked)"/><span class="sl"></span></label></td>
     <td>${x.requests}</td><td>${x.tokens_in} / ${x.tokens_out}</td>
     <td>${x.last_used?x.last_used.slice(0,16).replace('T',' '):'never'}</td>
     <td style="display:flex;gap:6px">

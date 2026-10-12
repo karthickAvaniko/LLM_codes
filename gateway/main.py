@@ -168,7 +168,8 @@ def _db():
 
 _KEY_COLS = ("id", "name", "email", "created", "active", "expires", "rpm_limit",
              "daily_limit", "requests", "tokens_in", "tokens_out", "last_used",
-             "self_service", "raw_key", "thinking", "ocr_enabled")
+             "self_service", "raw_key", "thinking", "ocr_enabled",
+             "isolated_queue")
 
 DEFAULT_RPM_LIMIT   = 60      # requests per minute per key
 DEFAULT_DAILY_LIMIT = 5000    # requests per UTC day per key
@@ -255,10 +256,11 @@ async def _replay_as_typing(full: str, chunk: int = 60):
 
 def _row_to_info(row: dict) -> dict:
     info = {k: row[k] for k in _KEY_COLS}
-    info["active"]       = bool(info["active"])
-    info["self_service"] = bool(info.get("self_service"))
-    info["thinking"]     = bool(info.get("thinking"))
-    info["ocr_enabled"]  = bool(info.get("ocr_enabled", True))
+    info["active"]         = bool(info["active"])
+    info["self_service"]   = bool(info.get("self_service"))
+    info["thinking"]       = bool(info.get("thinking"))
+    info["ocr_enabled"]    = bool(info.get("ocr_enabled", True))
+    info["isolated_queue"] = bool(info.get("isolated_queue", False))
     return info
 
 def _load_keys() -> dict:
@@ -279,6 +281,7 @@ def _load_keys() -> dict:
                 keys[h]["active"] = bool(info.get("active"))
                 keys[h]["self_service"] = bool(info.get("self_service"))
                 keys[h]["ocr_enabled"] = bool(info.get("ocr_enabled", True))
+                keys[h]["isolated_queue"] = bool(info.get("isolated_queue", False))
             if keys:
                 _persist_keys(keys)
                 KEYS_FILE.rename(KEYS_FILE.with_suffix(".json.migrated"))
@@ -1181,7 +1184,7 @@ _VLLM_TOTAL_SLOTS = 30   # vLLM launched with --max-num-seqs 32 (start_all.sh);
 # here is GPU decode-compute sharing, not admission queueing or KV-cache
 # capacity. 2 is the last concurrency level with no measured per-request
 # slowdown.
-_VLLM_RESERVED = {"CHAT": 8, "AGENT": 4, "VISION": 2, "DOCUMENT": 8}   # always-available
+_VLLM_RESERVED = {"CHAT": 7, "AGENT": 4, "VISION": 2, "DOCUMENT": 8, "ISOLATED": 1}   # always-available
                                                            # minimum per class
 assert sum(_VLLM_RESERVED.values()) <= _VLLM_TOTAL_SLOTS
 
@@ -1768,6 +1771,7 @@ async def admin_create_key(payload: dict):
         "last_used": None, "self_service": False,
         "raw_key": key, "thinking": False,
         "ocr_enabled": bool(payload.get("ocr_enabled", True)),
+        "isolated_queue": bool(payload.get("isolated_queue", False)),
     }
     await _save_keys_async()
     log.info(f"ADMIN created key | {name} | {email} | {key[:11]}...")
@@ -1806,6 +1810,20 @@ async def admin_set_key_ocr(key_id: str, payload: dict):
     await _save_keys_async()
     log.info(f"ADMIN set ocr_enabled={info['ocr_enabled']} | {info.get('id')}")
     return {"id": info.get("id"), "ocr_enabled": info["ocr_enabled"]}
+
+@app.post("/admin-api/keys/{key_id}/isolated-queue")
+async def admin_set_key_isolated_queue(key_id: str, payload: dict):
+    """Admin-only: route this key's /v1/chat/completions traffic through a
+    dedicated ISOLATED queue class instead of the normal CHAT/AGENT split.
+    OFF (default) is zero behavior change. Takes effect on the key's next
+    request — no restart needed."""
+    _, info = _find_by_id(key_id)
+    if not info:
+        return JSONResponse(status_code=404, content={"error": {"message": "Key not found"}})
+    info["isolated_queue"] = bool(payload.get("isolated_queue", False))
+    await _save_keys_async()
+    log.info(f"ADMIN set isolated_queue={info['isolated_queue']} | {info.get('id')}")
+    return {"id": info.get("id"), "isolated_queue": info["isolated_queue"]}
 
 @app.post("/admin-api/keys/{key_id}/delete")
 async def admin_delete_key(key_id: str):
@@ -2084,7 +2102,8 @@ def _key_summary(info: dict) -> dict:
             "tokens_in": info.get("tokens_in", 0), "tokens_out": info.get("tokens_out", 0),
             "last_used": info.get("last_used"),
             "key": info.get("raw_key"), "thinking": bool(info.get("thinking")),
-            "ocr_enabled": bool(info.get("ocr_enabled", True))}
+            "ocr_enabled": bool(info.get("ocr_enabled", True)),
+            "isolated_queue": bool(info.get("isolated_queue", False))}
 
 @app.post("/admin/keys")
 async def create_key(payload: dict):
@@ -3583,6 +3602,20 @@ def _web_search_sync(query: str) -> list[dict]:
         log.error(f"WEBSEARCH failed | {e}")
         return []
 
+_NO_WEB_NEEDED_TASKS = ("extraction", "coding", "reasoning", "classification")
+
+def _should_skip_web_check(ws, task_auto_classified: bool, task: str) -> bool:
+    """True when the _needs_web() classifier call (and any resulting
+    _web_context() retrieval) can be skipped entirely: the request is on the
+    default "auto" web_search decision, its task was resolved by the
+    _detect_task() classifier itself (not an explicit client task or the
+    img_resolved shortcut), and that task is one that never benefits from
+    live web results. An explicit web_search:true/false always takes its own
+    path untouched, and any unrecognized/ambiguous task falls through to the
+    existing behavior (the check still runs)."""
+    return (ws == "auto" and task_auto_classified
+            and task in _NO_WEB_NEEDED_TASKS)
+
 async def _needs_web(messages: list) -> bool:
     """Ask the model itself whether the question needs live/current web data.
     Fully dynamic — no fixed keyword list. One tiny, fast classification call."""
@@ -3788,6 +3821,10 @@ async def chat_completions(request: Request):
     # white-label: clients send "avaniko-ai" (or anything) — we serve our
     # engine and stamp PUBLIC_MODEL on every response
     body["model"] = MODEL
+    # Internal-only correlation id for diagnostic logs (e.g. WEB_DECISION
+    # below) — never returned to the client, never part of the request or
+    # response contract.
+    _req_id = uuid.uuid4().hex[:12]
     # Gemini/GPT-style: one key, every skill works automatically. With no
     # "task" given we default to "auto" — the model classifies its own task
     # (chat / reasoning / coding / extraction) and gets the right temperature
@@ -3819,6 +3856,11 @@ async def chat_completions(request: Request):
     else:
         task = str(body.pop("task", "auto")).lower()
         client_set_thinking = "chat_template_kwargs" in body
+        # True only when `task` came from the _detect_task() classifier call
+        # itself — NOT from an explicit client value or the img_resolved
+        # shortcut. Only that path is eligible to skip the web-search-need
+        # check below (see _should_skip_web_check).
+        _task_auto_classified = False
         if task == "auto" and isinstance(body.get("messages"), list):
             if img_resolved:
                 # invoice/document image → deterministic extraction preset
@@ -3828,6 +3870,7 @@ async def chat_completions(request: Request):
             else:
                 try:
                     task = await _detect_task(body["messages"])
+                    _task_auto_classified = True
                     log.info(f"CHAT | auto task: {task}")
                 except Exception as e:
                     log.warning(f"auto task failed → chat: {e}")
@@ -3863,7 +3906,18 @@ async def chat_completions(request: Request):
                 + body["messages"])
             # web_search: true = force, false = never, "auto"/absent = decide by query
             ws = body.pop("web_search", "auto")
-            use_web = ws is True or (ws == "auto" and await _needs_web(body["messages"]))
+            if _should_skip_web_check(ws, _task_auto_classified, task):
+                use_web = False
+                _web_check = "skipped"
+            else:
+                use_web = ws is True or (ws == "auto" and await _needs_web(body["messages"]))
+                _web_check = "executed" if ws == "auto" else "n/a"
+            # Diagnostic only — task is a one-word classification label, never
+            # message content. No prompts, documents, keys, or headers here.
+            log.info("WEB_DECISION | req_id=%s task=%s web_search=%s web_check=%s",
+                     _req_id, task,
+                     "forced" if ws is True else "disabled" if ws is False else "auto",
+                     _web_check)
             if use_web:
                 ctx = await _web_context(body["messages"],
                                          getattr(request.state, "key_hash", None))
@@ -3876,9 +3930,16 @@ async def chat_completions(request: Request):
     ip       = _client_ip(request)
     key_hash = getattr(request.state, "key_hash", None)
     start    = time.time()
-    # tool-calling turns get their own reserved AGENT slots (see _agent above)
-    # so a busy document queue can't add latency to an in-progress agent loop
-    _qclass  = "AGENT" if _agent else "CHAT"
+    # Per-key override: an admin-enabled isolated_queue key always routes
+    # here, regardless of tools/agent — OFF by default, zero behavior
+    # change for every other key.
+    if key_hash and API_KEYS.get(key_hash, {}).get("isolated_queue"):
+        _qclass = "ISOLATED"
+        log.info(f"CHAT | routed to ISOLATED queue class | key={API_KEYS.get(key_hash, {}).get('id')}")
+    else:
+        # tool-calling turns get their own reserved AGENT slots (see _agent above)
+        # so a busy document queue can't add latency to an in-progress agent loop
+        _qclass  = "AGENT" if _agent else "CHAT"
 
     async def event_stream():
         raw = b""

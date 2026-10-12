@@ -22,8 +22,9 @@ CREATE TABLE IF NOT EXISTS api_keys (
   last_used    VARCHAR(64)  NULL,
   self_service TINYINT(1)   DEFAULT 0,
   raw_key      VARCHAR(64),
-  thinking     TINYINT(1)   DEFAULT 0,
-  ocr_enabled  TINYINT(1)   DEFAULT 1,
+  thinking        TINYINT(1)   DEFAULT 0,
+  ocr_enabled     TINYINT(1)   DEFAULT 1,
+  isolated_queue  TINYINT(1)   DEFAULT 0,
   INDEX (email)
 ) CHARACTER SET utf8mb4;
 
