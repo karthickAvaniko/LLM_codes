@@ -1216,9 +1216,13 @@ class _VLLMScheduler:
 
     async def acquire(self, cls: str):
         cls = cls if cls in self._reserved else "DOCUMENT"
+        _t0 = time.time()
         async with self._cond:
             await self._cond.wait_for(lambda: self._can_admit(cls))
             self._in_flight[cls] += 1
+        _wait_ms = int((time.time() - _t0) * 1000)
+        if _wait_ms > 50:   # skip logging the common case (admitted immediately)
+            log.info(f"TIMING | admission_wait_ms={_wait_ms} | class={cls}")
 
     async def release(self, cls: str):
         cls = cls if cls in self._reserved else "DOCUMENT"
@@ -1925,7 +1929,20 @@ async def health():
             vllm_ok = r.status_code == 200
         except Exception:
             vllm_ok = False
-    return {"gateway": "ok", "vllm": "ok" if vllm_ok else "down", "model": PUBLIC_MODEL}
+    resp = {"gateway": "ok", "vllm": "ok" if vllm_ok else "down", "model": PUBLIC_MODEL}
+    # Additive only (2026-10-13): surface the same vLLM load numbers the admin
+    # dashboard already reads, plus the gateway's own admission-queue depth per
+    # class, so callers can tell "busy" from "stuck" instead of just timing out.
+    metrics = await _vllm_metrics()
+    if metrics:
+        resp["vllm_running"] = metrics.get("running")
+        resp["vllm_waiting"] = metrics.get("waiting")
+        resp["vllm_kv_cache_usage_pct"] = metrics.get("kv_cache_usage_pct")
+    resp["gateway_queue"] = {
+        cls: {"in_flight": _vllm_sched._in_flight.get(cls, 0), "reserved": _vllm_sched._reserved.get(cls, 0)}
+        for cls in _vllm_sched._reserved
+    }
+    return resp
 
 # ── System dashboard (admin console "System" tab) — added 2026-09-18 ───────
 def _gpu_stats_sync() -> dict | None:
@@ -3548,7 +3565,9 @@ async def _resolve_images(messages: list) -> tuple[list, bool]:
                 if img:
                     page_no += 1
                     any_image = True
+                    _t_ocr0 = time.time()
                     txt = await loop.run_in_executor(None, ocr_image, img, "chat-image")
+                    log.info(f"TIMING | ocr_wait_ms={int((time.time() - _t_ocr0) * 1000)} | chat-image p{page_no}")
                     parts.append({"type": "text", "text":
                         f"[Page {page_no} — OCR/extracted text (use for precise numbers — "
                         f"cross-check against the page image below for anything ambiguous, "
@@ -3945,10 +3964,15 @@ async def chat_completions(request: Request):
         raw = b""
         async with httpx.AsyncClient(timeout=300) as c, _vllm_sched.slot(_qclass):
             for attempt in range(4):
+                _t_vllm0 = time.time()
+                _ttft_logged = False
                 async with c.stream("POST", f"{VLLM_URL}/v1/chat/completions",
                                     json=body) as r:
                     if r.status_code == 200:
                         async for chunk in r.aiter_bytes():
+                            if not _ttft_logged:
+                                log.info(f"TIMING | vllm_ttft_ms={int((time.time() - _t_vllm0) * 1000)} | class={_qclass}")
+                                _ttft_logged = True
                             raw += chunk
                             yield chunk.replace(f'"model":"{MODEL}"'.encode(),
                                                 f'"model":"{PUBLIC_MODEL}"'.encode())
