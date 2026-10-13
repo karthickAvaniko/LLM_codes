@@ -16,6 +16,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import cv2
 import fitz  # PyMuPDF
 import httpx
 import numpy as np
@@ -202,10 +203,17 @@ def _hash_key(token: str) -> str:
 # Hashing the rules text in means any prompt edit automatically invalidates
 # every previously cached result, with nothing to remember to do by hand.
 def _extraction_cache_key(content: bytes, question: str, hints: str,
-                           output_schema: str, consistency: int, canonicalize: bool) -> str:
+                           output_schema: str, consistency: int, canonicalize: bool,
+                           ocr_mode: str = "") -> str:
+    # ocr_mode added 2026-10-13 (smart OCR routing) -- different routing
+    # modes can produce different page text/answers for the same file, so
+    # it must be part of the key. Existing callers that don't pass it get
+    # "" (one-time cache invalidation for previously-cached results, same
+    # as every prior EXTRACTION_RULES edit already does by design).
     h = hashlib.sha256()
     for part in (content, question.encode(), hints.encode(), output_schema.encode(),
-                 f"{consistency}|{canonicalize}".encode(), EXTRACTION_RULES.encode()):
+                 f"{consistency}|{canonicalize}".encode(), EXTRACTION_RULES.encode(),
+                 ocr_mode.encode()):
         h.update(part); h.update(b"\x00")
     return h.hexdigest()
 
@@ -776,6 +784,55 @@ def extract_pages(content: bytes, filename: str) -> list[str]:
     except Exception:
         return [""]
 
+def extract_pages_routed(content: bytes, filename: str) -> tuple[list[str], list[dict] | None]:
+    """Opt-in alternative to extract_pages(), used only when /v1/extract is
+    called with ocr_mode=auto — the original extract_pages() is untouched
+    and still used by every other caller (default behavior unchanged).
+
+    Per-page rule: a page's native PDF text is used directly (no OCR call
+    at all) UNLESS the page is a "scan" (native text < OCR_SCAN_MIN_CHARS,
+    OR one embedded image covers >= 80% of the page area — a scanner PDF's
+    own hidden OCR text layer can be wrong, so high image coverage counts
+    as a scan even with plenty of native chars) or "blurry" (Laplacian
+    variance of the 144 DPI render < OCR_BLUR_THRESHOLD) — in which case
+    OCR runs exactly as extract_pages() already does today.
+
+    Returns (pages_text, page_ocr) where page_ocr is None for non-PDF
+    inputs (this routing only applies to PDFs; everything else falls back
+    to the unchanged extract_pages())."""
+    ext = filename.lower().rsplit(".", 1)[-1]
+    if ext != "pdf":
+        return extract_pages(content, filename), None
+
+    doc = fitz.open(stream=content, filetype="pdf")
+    pages, page_ocr = [], []
+    for i, page in enumerate(doc):
+        native = page.get_text()
+        native_chars = len(native.strip())
+        img_frac = _page_image_area_fraction(page)
+        is_scan = native_chars < OCR_SCAN_MIN_CHARS or img_frac >= 0.80
+
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+        buf = io.BytesIO()
+        Image.frombytes("RGB", [pix.width, pix.height], pix.samples).save(buf, "PNG")
+        png_bytes = buf.getvalue()
+        blur = _blur_score(png_bytes)
+        is_blurry = blur < OCR_BLUR_THRESHOLD
+
+        if is_scan or is_blurry:
+            ocr_text = ocr_image(png_bytes, f"{filename} p{i+1} routed")
+            text = ocr_text if len(ocr_text.strip()) > native_chars else native
+            reason = "scan" if is_scan else "blur"
+            pages.append(text)
+            page_ocr.append({"page": i + 1, "ocr_used": True, "reason": reason,
+                             "blur_score": round(blur, 1)})
+        else:
+            pages.append(native)
+            page_ocr.append({"page": i + 1, "ocr_used": False, "reason": "none",
+                             "blur_score": round(blur, 1)})
+    doc.close()
+    return pages, page_ocr
+
 def extract_page_images(content: bytes, filename: str, pages_text: list[str] | None = None) -> list[bytes]:
     """Render each page as a PNG for native multimodal vision (used by
     /v1/extract's vision-hybrid path). OCR text alone can never see a logo,
@@ -809,6 +866,50 @@ def extract_text(content: bytes, filename: str) -> str:
 def _warm_ocr():
     """OCR now lives in its own service (ocr_server.py) — nothing to warm here."""
     pass
+
+# ── Smart OCR routing (2026-10-13) — opt-in only, default behavior unchanged ──
+# OCR_BLUR_THRESHOLD: Laplacian-variance cutoff below which a page image is
+# treated as "blurry" (needs OCR). Env var so it can be tuned without a code
+# change — default 500 came from a controlled with/without-OCR accuracy test
+# (10 synthetically degraded pages): the best zero-false-negative cutoff
+# found, not a guess.
+OCR_BLUR_THRESHOLD = float(os.environ.get("OCR_BLUR_THRESHOLD", "500"))
+# OCR_SCAN_MIN_CHARS: a PDF page with fewer native text characters than this
+# is treated as "scanned" (no usable text layer). Same threshold the
+# existing extract_pages() OCR-fallback already uses, exposed as its own
+# env var for the new routing logic specifically.
+OCR_SCAN_MIN_CHARS = int(os.environ.get("OCR_SCAN_MIN_CHARS", "300"))
+
+def _blur_score(img_bytes: bytes) -> float:
+    """Laplacian variance of the grayscale image — low score = blurry.
+    Pure CPU, no network call; cheap enough to run inline."""
+    try:
+        arr = np.frombuffer(img_bytes, dtype=np.uint8)
+        cv_img = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+        if cv_img is None:
+            return 0.0
+        return float(cv2.Laplacian(cv_img, cv2.CV_64F).var())
+    except Exception as e:
+        log.warning(f"blur score failed: {e}")
+        return 0.0
+
+def _page_image_area_fraction(page) -> float:
+    """Fraction of a PDF page's area covered by embedded raster images —
+    used to catch a scanner PDF with a hidden (possibly wrong) OCR text
+    layer even when its native-text char count looks high enough to pass
+    as born-digital."""
+    try:
+        area = page.rect.width * page.rect.height
+        if area <= 0:
+            return 0.0
+        covered = 0.0
+        for img in page.get_images(full=True):
+            for rect in page.get_image_rects(img[0]):
+                covered += rect.width * rect.height
+        return min(covered / area, 1.0)
+    except Exception as e:
+        log.warning(f"page image area check failed: {e}")
+        return 0.0
 
 # ── Document Q&A engine ───────────────────────────────────
 # Model context is 32k tokens. Strategy chosen automatically by size:
@@ -3291,7 +3392,15 @@ async def batch_extract(request: Request,
                         output_schema: str = Form(default=""),
                         consistency: int = Form(default=1),
                         canonicalize: bool = Form(default=False),
-                        force_refresh: bool = Form(default=False)):
+                        force_refresh: bool = Form(default=False),
+                        ocr_mode: str = Form(default="")):
+    # Opt-in smart OCR routing (2026-10-13): default "" = unchanged
+    # behavior (extract_pages() always OCRs sparse-text pages, exactly as
+    # before). ocr_mode="auto" applies the new per-page scan/blur rule via
+    # extract_pages_routed() instead. Any other value is treated as "".
+    ocr_mode = ocr_mode.strip().lower()
+    if ocr_mode not in ("", "auto"):
+        ocr_mode = ""
     if len(files) > MAX_BATCH_FILES:
         return JSONResponse(status_code=400, content={"error": {
             "message": f"You sent {len(files)} files — max {MAX_BATCH_FILES} per request. "
@@ -3335,7 +3444,7 @@ async def batch_extract(request: Request,
         if len(content) > MAX_FILE_MB * 1024 * 1024:
             return {"filename": fname, "error": f"File too large (max {MAX_FILE_MB} MB)"}
         cache_key = _extraction_cache_key(content, effective_question, hints,
-                                          output_schema, n_samples, canonicalize)
+                                          output_schema, n_samples, canonicalize, ocr_mode)
         if not force_refresh:
             cached = await loop.run_in_executor(None, _extraction_cache_get, cache_key)
             if cached is not None:
@@ -3344,7 +3453,11 @@ async def batch_extract(request: Request,
 
         async with sem:
             try:
-                pages = await loop.run_in_executor(None, extract_pages, content, fname)
+                page_ocr = None
+                if ocr_mode == "auto":
+                    pages, page_ocr = await loop.run_in_executor(None, extract_pages_routed, content, fname)
+                else:
+                    pages = await loop.run_in_executor(None, extract_pages, content, fname)
                 if not sum(len(p.strip()) for p in pages):
                     return {"filename": fname, "error":
                             "No readable text could be extracted from this file "
@@ -3462,6 +3575,8 @@ async def batch_extract(request: Request,
 
                 result = {"filename": fname, "pages": len(pages), "strategy": strategy,
                          "answer": answer, "validation": {**validation, "corrected": corrected}}
+                if page_ocr is not None:
+                    result["page_ocr"] = page_ocr
                 if field_renames:
                     result["field_renames"] = field_renames
                 if field_confidence:
@@ -3587,6 +3702,105 @@ async def _resolve_images(messages: list) -> tuple[list, bool]:
         # occasionally — every inline-image call was missing this entirely.
         out = [{"role": "system", "content": DOC_SYSTEM + EXTRACTION_RULES}] + out
     return out, any_image
+
+async def _resolve_images_routed(messages: list, mode: str) -> tuple[list, bool, "asyncio.Task | None", list[dict]]:
+    """Smart OCR routing (2026-10-13) for /v1/chat/completions, mode in
+    ('off','auto','separate'). Unlike _resolve_images(), this NEVER injects
+    OCR text into the prompt — images pass through untouched, exactly as
+    the client sent them. The gateway only ever sees the rendered image
+    here (not the source PDF), so "scanned vs born-digital" can't be
+    determined server-side; that's the client's call (via mode itself).
+    The gateway does run its own blur check on the image it receives.
+
+    'off'      -> no OCR at all.
+    'auto'     -> blur-score the image; OCR only if blurry, scheduled as a
+                  background task the caller awaits CONCURRENTLY with the
+                  vLLM call (not before it) via asyncio.create_task below.
+    'separate' -> always schedule OCR the same way, regardless of blur.
+
+    Returns (messages, any_image, ocr_task, per_image_meta) where ocr_task
+    is an already-started asyncio.Task (or None if no OCR was scheduled)
+    resolving to (ocr_text, ocr_wait_ms), and per_image_meta has one dict
+    per image found: {"blur_score": float|None, "reason": str|None}."""
+    loop = asyncio.get_event_loop()
+    out = []
+    any_image = False
+    image_payloads: list[bytes] = []
+    for m in messages:
+        c = m.get("content")
+        if not isinstance(c, list):
+            out.append(m); continue
+        parts = []
+        for p in c:
+            if not isinstance(p, dict):
+                parts.append({"type": "text", "text": str(p)}); continue
+            if p.get("type") == "text":
+                parts.append({"type": "text", "text": p.get("text", "")})
+            elif p.get("type") == "image_url":
+                url = (p.get("image_url") or {}).get("url", "")
+                img = None
+                try:
+                    if url.startswith("data:") and "," in url:
+                        img = base64.b64decode(url.split(",", 1)[1])
+                    elif url.startswith("http"):
+                        async with httpx.AsyncClient(timeout=60) as ic:
+                            rr = await ic.get(url)
+                            img = rr.content
+                except Exception as e:
+                    log.error(f"image decode failed | {e}")
+                if img:
+                    any_image = True
+                    image_payloads.append(img)
+                    parts.append({"type": "image_url", "image_url":
+                        {"url": "data:image/png;base64," + base64.b64encode(img).decode()}})
+        out.append({**m, "content": parts})
+    if any_image:
+        # same forced extraction-quality preset as _resolve_images() above —
+        # only the OCR-text-injection behavior changes between the two,
+        # nothing about task routing / system prompt.
+        out = [{"role": "system", "content": DOC_SYSTEM + EXTRACTION_RULES}] + out
+
+    per_image_meta = []
+    to_ocr = []
+    for img in image_payloads:
+        blur, reason = None, None
+        if mode == "auto":
+            blur = _blur_score(img)
+            if blur < OCR_BLUR_THRESHOLD:
+                reason = "blur"
+                to_ocr.append(img)
+        elif mode == "separate":
+            reason = "requested"
+            to_ocr.append(img)
+        per_image_meta.append({"blur_score": blur, "reason": reason})
+
+    ocr_task = None
+    if to_ocr:
+        async def _run_ocr():
+            t0 = time.time()
+            texts = []
+            for i, img in enumerate(to_ocr, 1):
+                txt = await loop.run_in_executor(None, ocr_image, img, "chat-image-routed")
+                texts.append(f"[Page {i}]\n{txt}" if len(to_ocr) > 1 else txt)
+            return "\n\n".join(texts), int((time.time() - t0) * 1000)
+        ocr_task = asyncio.create_task(_run_ocr())  # starts running NOW, concurrently
+    return out, any_image, ocr_task, per_image_meta
+
+async def _await_ocr_routed(ocr_task, per_image_meta: list[dict], mode: str) -> dict:
+    """Await an OCR task scheduled by _resolve_images_routed() (if any,
+    already running concurrently with the vLLM call by the time this is
+    called) and return a dict used both for the one-line-per-request log
+    and, for non-streaming requests, merged into the JSON response."""
+    blur_score = per_image_meta[0]["blur_score"] if per_image_meta else None
+    reason = per_image_meta[0]["reason"] if per_image_meta else None
+    ocr_text, ocr_wait_ms = None, 0
+    if ocr_task is not None:
+        try:
+            ocr_text, ocr_wait_ms = await ocr_task
+        except Exception as e:
+            log.error(f"parallel OCR failed | {e}")
+    return {"ocr_used": ocr_task is not None, "reason": reason, "blur_score": blur_score,
+            "ocr_text": ocr_text, "ocr_wait_ms": ocr_wait_ms}
 
 def _fit_messages(msgs: list, limit: int = MAX_INPUT_CHARS) -> list:
     """Never let a chatbot's growing history hit the token limit: keep system
@@ -3849,9 +4063,27 @@ async def chat_completions(request: Request):
     # (chat / reasoning / coding / extraction) and gets the right temperature
     # + thinking-mode, so reasoning questions think and chat stays fast.
     # Explicit client params ALWAYS win; auto never reduces max_tokens.
+    # Smart OCR routing (2026-10-13), additive and opt-in: "ocr_mode" body
+    # field or X-OCR-Mode header selects how inline images are handled.
+    # Absent/"inline" (and no "skip_ocr") -> _resolve_images(), byte-for-byte
+    # the original behavior (OCR awaited before the prompt is built, text
+    # injected). "skip_ocr": true is kept as an alias for ocr_mode="off".
+    _skip_ocr_alias = bool(body.pop("skip_ocr", False))
+    _ocr_mode = str(body.pop("ocr_mode", "") or request.headers.get("x-ocr-mode") or "").strip().lower()
+    if not _ocr_mode:
+        _ocr_mode = "off" if _skip_ocr_alias else "inline"
+    if _ocr_mode not in ("inline", "off", "auto", "separate"):
+        _ocr_mode = "inline"
+
+    _ocr_task = None
+    _ocr_image_meta: list[dict] = []
     # text-only model: OCR any inline images first so vision-format requests work
     if isinstance(body.get("messages"), list):
-        body["messages"], img_resolved = await _resolve_images(body["messages"])
+        if _ocr_mode == "inline":
+            body["messages"], img_resolved = await _resolve_images(body["messages"])
+        else:
+            body["messages"], img_resolved, _ocr_task, _ocr_image_meta = \
+                await _resolve_images_routed(body["messages"], _ocr_mode)
     else:
         img_resolved = False
     # Agentic clients (Continue/Cline agent mode, MCP tools) send `tools` /
@@ -3962,17 +4194,17 @@ async def chat_completions(request: Request):
 
     async def event_stream():
         raw = b""
+        _ttft_ms = None
         async with httpx.AsyncClient(timeout=300) as c, _vllm_sched.slot(_qclass):
             for attempt in range(4):
                 _t_vllm0 = time.time()
-                _ttft_logged = False
                 async with c.stream("POST", f"{VLLM_URL}/v1/chat/completions",
                                     json=body) as r:
                     if r.status_code == 200:
                         async for chunk in r.aiter_bytes():
-                            if not _ttft_logged:
-                                log.info(f"TIMING | vllm_ttft_ms={int((time.time() - _t_vllm0) * 1000)} | class={_qclass}")
-                                _ttft_logged = True
+                            if _ttft_ms is None:
+                                _ttft_ms = int((time.time() - _t_vllm0) * 1000)
+                                log.info(f"TIMING | vllm_ttft_ms={_ttft_ms} | class={_qclass}")
                             raw += chunk
                             yield chunk.replace(f'"model":"{MODEL}"'.encode(),
                                                 f'"model":"{PUBLIC_MODEL}"'.encode())
@@ -4000,6 +4232,16 @@ async def chat_completions(request: Request):
                 except Exception:
                     pass
         _record_tokens(key_hash, usage)
+        _ocr_info = await _await_ocr_routed(_ocr_task, _ocr_image_meta, _ocr_mode)
+        log.info(f"TIMING | ocr_mode={_ocr_mode} | ocr_used={_ocr_info['ocr_used']} | "
+                 f"reason={_ocr_info['reason']} | blur_score={_ocr_info['blur_score']} | "
+                 f"ocr_wait_ms={_ocr_info['ocr_wait_ms']} | vllm_ttft_ms={_ttft_ms}")
+        # Streaming responses don't have a natural top-level JSON slot for
+        # ocr_text/ocr_reason/blur_score (SSE is a sequence of OpenAI-shaped
+        # delta chunks) — routing/latency behavior is identical to the
+        # non-streaming path, but those extra fields are only returned for
+        # non-streaming requests. The OCR task is still always awaited (not
+        # orphaned) so it's correctly reflected in this log line either way.
         _log_async(CONTENT_LOG, {"type": "chat", "ip": ip, "stream": True,
                                     "messages": body.get("messages", []),
                                     "answer": answer, "usage": usage,
@@ -4011,19 +4253,42 @@ async def chat_completions(request: Request):
                                           "X-Accel-Buffering": "no"})
 
     async with httpx.AsyncClient(timeout=300) as c:
+        _t_vllm0 = time.time()
         r = await _vllm_post(c, body, queue_class=_qclass)   # auto-shrinks + retries on context overflow
+        # Non-streaming has no separate "first token" signal distinct from
+        # the full response -- this is the whole round-trip time, reported
+        # under the same vllm_ttft_ms name as the streaming path's real TTFT
+        # for a consistent log schema (documented limitation, not a bug).
+        _ttft_ms = int((time.time() - _t_vllm0) * 1000)
         data = r.json()
         try:
             answer = data["choices"][0]["message"].get("content", "")
         except Exception:
             answer = ""
         _record_tokens(key_hash, data.get("usage"))
+        # _ocr_task (if any) was started before the vLLM call above, so it
+        # has been running concurrently with it this whole time -- this
+        # await just collects whatever result is ready (or finishes waiting
+        # for it), never re-starts it sequentially.
+        _ocr_info = await _await_ocr_routed(_ocr_task, _ocr_image_meta, _ocr_mode)
+        log.info(f"TIMING | ocr_mode={_ocr_mode} | ocr_used={_ocr_info['ocr_used']} | "
+                 f"reason={_ocr_info['reason']} | blur_score={_ocr_info['blur_score']} | "
+                 f"ocr_wait_ms={_ocr_info['ocr_wait_ms']} | vllm_ttft_ms={_ttft_ms}")
         _log_async(CONTENT_LOG, {"type": "chat", "ip": ip, "stream": False,
                                     "messages": body.get("messages", []),
                                     "answer": answer, "usage": data.get("usage"),
                                     "ms": int((time.time() - start) * 1000)})
         if "model" in data:
             data["model"] = PUBLIC_MODEL
+        if _ocr_mode in ("auto", "separate") and r.status_code == 200:
+            # additive only -- these keys don't exist in the default/inline
+            # response shape at all, so there's nothing for an existing
+            # client to collide with.
+            if _ocr_info["ocr_used"]:
+                data["ocr_text"] = _ocr_info["ocr_text"]
+                data["ocr_reason"] = _ocr_info["reason"]
+            if _ocr_mode == "auto":
+                data["blur_score"] = _ocr_info["blur_score"]
         # pass the real status through — a vLLM error must never look like a 200
         return JSONResponse(data, status_code=r.status_code)
 
