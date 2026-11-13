@@ -74,8 +74,36 @@ IDENTITY_PROMPT = (
     "or unnecessary preamble. Use headers/bullets only when they aid "
     "scanability, not by default.\n\n"
     "If you don't know something or aren't confident, say so rather than "
-    "guessing. Do not invent citations, links, file paths, statistics, or API "
-    "details — if a document or web source doesn't contain the answer, say so."
+    "guessing. Never state a fact, number, date, ID, or field value unless it "
+    "is directly present in the provided text/document/OCR output or the "
+    "conversation — if it is not there, say so instead of guessing, "
+    "estimating, or filling in a typical/expected value.\n\n"
+    "When extracting structured data (JSON, tables, forms), never copy a "
+    "value from one field into a different field because they look similar "
+    "or the layout is ambiguous — each field must trace to its own distinct "
+    "location in the source. If two extracted fields would end up identical, "
+    "re-check the source before accepting it. Never silently compute or "
+    "'correct' a missing/unclear number by deriving it from other numbers "
+    "(e.g. backing into a total, assuming a tax rate, assuming a line item "
+    "equals another line item) — if a value is missing, illegible, or "
+    "inconsistent with the surrounding math, say so explicitly. If a "
+    "required field cannot be found, output null/'not found' for it — never "
+    "substitute a guess, default, or a neighboring field's value.\n\n"
+    "Do not invent citations, links, file paths, statistics, document IDs, "
+    "tax/registration numbers, or API details — if a document or web source "
+    "doesn't contain the answer, say so. When not fully certain a stated "
+    "value is correct, say so plainly rather than presenting it with the "
+    "same confidence as a verified fact.\n\n"
+    "Invoices/forms often show a column of labels (e.g. FREIGHT, G.S.T., "
+    "Q.S.T.) stacked next to a column of numbers — count the labels and the "
+    "numbers separately before pairing them up. If a label's row has no "
+    "number printed directly beside it (a blank/empty cell), that field's "
+    "value is 0 or null — it is NOT the number that belongs to the next or "
+    "previous label. Never shift a value up or down a row to fill a gap. "
+    "Before finalizing totals-style fields (freight, tax, discount, "
+    "shipping, etc.), re-verify each by counting rows top-to-bottom against "
+    "its own printed number, not by assuming adjacency or reusing a number "
+    "that already belongs to a different, clearly-labeled field."
 )
 STATIC    = Path(__file__).parent / "static"
 
@@ -478,11 +506,16 @@ async def _release_ip_extract_slot(ip: str):
 # port -- it never touches _resolve_key/_check_rate_limit/the per-key
 # concurrency cap and never appears in access.jsonl as real traffic.
 _last_request_ts = time.time()
-VLLM_IDLE_KEEPALIVE_SECS = 120
+VLLM_IDLE_KEEPALIVE_SECS = 30
 
 async def _vllm_keepalive_loop():
     global _last_request_ts
-    async with httpx.AsyncClient(timeout=30) as c:
+    # timeout=60, not 30: a genuinely cold engine has been observed taking up
+    # to ~46s for a single token (gateway_app.log, 2026-10-14 10:03:05). A
+    # ping that gives up at 30s can abandon mid-warm-up on exactly the
+    # coldest starts it exists to prevent, without even knowing whether the
+    # request landed.
+    async with httpx.AsyncClient(timeout=60) as c:
         while True:
             await asyncio.sleep(30)
             idle_for = time.time() - _last_request_ts
@@ -533,13 +566,14 @@ async def require_api_key(request: Request, call_next):
     start = time.time()
     ip    = _client_ip(request)
 
-    # Marks the engine as "recently active" for the keep-alive loop above.
-    # Excludes /health specifically -- the watchdog polls it every 15s
-    # (gateway_watchdog.sh), which would otherwise never let the idle timer
-    # reach VLLM_IDLE_KEEPALIVE_SECS and the keep-alive would never fire.
-    if request.url.path != "/health":
-        global _last_request_ts
-        _last_request_ts = time.time()
+    # "Recently active" for the keep-alive loop is now marked in
+    # _VLLMScheduler.acquire() -- i.e. when a real vLLM call is actually
+    # about to go out -- not here at the top of the middleware. Marking it
+    # here on mere HTTP arrival let a request that is itself the victim of a
+    # cold engine falsely signal "recent activity" the instant it landed,
+    # before it ever touched vLLM, which suppressed the very ping that would
+    # have prevented its own cold start (confirmed 2026-10-14, see the
+    # karthick-key incidents in gateway_app.log).
 
     if request.method == "OPTIONS" or request.url.path in PUBLIC_PATHS:
         is_extract = request.method == "POST" and request.url.path == "/v1/extract"
@@ -676,15 +710,15 @@ async def require_api_key(request: Request, call_next):
                                "ms": int((time.time() - start) * 1000), "auth": user})
     return response
 
-# ── OCR via isolated microservice pool (127.0.0.1:7780-7783) ─
+# ── OCR via isolated microservice pool (127.0.0.1:7790,7791,7782,7783) ─
 # PaddleOCR runs in 4 independent processes with auto-restart. A Paddle
 # crash never touches the gateway; a hang is bounded by the request
 # timeout. Requests round-robin across the pool with automatic fallback
 # to the next instance on failure, so one dead/slow worker doesn't stall
 # a request — it just costs one extra hop.
 OCR_URLS = [
-    "http://127.0.0.1:7780",
-    "http://127.0.0.1:7781",
+    "http://127.0.0.1:7790",
+    "http://127.0.0.1:7791",
     "http://127.0.0.1:7782",
     "http://127.0.0.1:7783",
 ]
@@ -1024,6 +1058,22 @@ EXTRACTION_RULES = (
     "it as unit_price misrepresents what the document actually shows. If "
     "the real unit price genuinely isn't printed anywhere for that row, "
     "leave unit_price null rather than backfilling it with a division.\n"
+    "- Pack-priced rows (added 2026-10-17): when a line's price is printed "
+    "per pack or per billing unit (for example \"$132.00 / CW\", \"$81.30 / "
+    "RL\", \"per C\", \"per M\", \"per 100\", \"/ box\", \"/ case\"), copy "
+    "that printed price EXACTLY into unit_price and the printed pack unit "
+    "into that row's \"unit\" field (CW, RL, C, M, BX, CS, etc.). Do NOT "
+    "divide, multiply, or convert it into a per-piece or \"EA\" price, even "
+    "when the quantity is counted in pieces. Keep the quantity exactly as "
+    "printed. If a different page of the same packet (a purchase order, "
+    "packing slip, or delivery note) shows a different price for the same "
+    "item, do NOT replace the invoice's printed price with it — the "
+    "invoice's own priced row is authoritative for unit_price and unit. "
+    "Never invent a unit_price that is not printed on the invoice page. If "
+    "the printed pack price, the quantity, and the row amount do not agree, "
+    "keep every printed value unchanged, set that row's \"review_required\" "
+    "to true, and add a short \"note\" field naming the mismatch. Never "
+    "change a number just to make the row reconcile.\n"
     "- Flat invoice-level charges vs per-record line items: some documents mix "
     "two different kinds of rows in the same table — per-record items (one row "
     "per person/product/unit, e.g. an employee's weekly garment charge, each "
@@ -1228,10 +1278,58 @@ EXTRACTION_RULES = (
     "never relabeled as \"website\" just because it was the nearest unlabeled "
     "value. Same principle for any other field: don't rename a value's own "
     "label to a different field name that doesn't match what the value is.\n"
+    "- Totals/charges block label-value alignment: a totals section (e.g. "
+    "NET AMOUNT, FREIGHT, G.S.T., Q.S.T., DISCOUNT, SHIPPING, TOTAL DUE) is "
+    "usually printed as a column of labels next to a column of numbers. "
+    "Count the labels and count the numbers separately, then pair each "
+    "number with the label on its OWN same row by vertical position — never "
+    "by assuming the Nth number belongs to the Nth label if a row is blank. "
+    "If a label has no number printed directly beside it, that field's "
+    "value is 0 or null for this document — it is NEVER the number that "
+    "sits next to the label above or below it. Do not shift any number up "
+    "or down a row to avoid leaving a field at 0/null. Before finalizing "
+    "these fields, re-verify: does the sum of the non-null amounts you "
+    "extracted (net + freight + tax + shipping + discount, etc.) actually "
+    "equal TOTAL DUE as printed? If it only matches when you treat a field "
+    "as 0 rather than reusing a neighboring label's number, that confirms "
+    "the field is genuinely 0/blank, not the neighbor's value.\n"
     "- Output purity: the ONLY non-JSON content allowed is the single 'Row "
     "count: N' line above. No other explanation, preamble, summary, or "
     "markdown code fences (```) — the response must be that one line "
-    "followed immediately by the raw JSON object."
+    "followed immediately by the raw JSON object.\n"
+    "- CRITICAL financial-field independence (added 2026-11-12 after a "
+    "production incident where a printed GST amount was duplicated into "
+    "FREIGHT): this rule is deliberately GENERAL, not tied to any fixed list "
+    "of field names, currency, country, or language — it applies to every "
+    "invoice regardless of which specific charges/taxes it happens to print. "
+    "EVERY individually labeled amount in a totals/charges block (net "
+    "amount/subtotal, freight/shipping/delivery/carriage, and every "
+    "individually named tax/levy/duty — GST, HST, PST, QST, VAT, IVA, sales "
+    "tax, consumption tax, service tax, environmental levy, or any other "
+    "name a document happens to print, this list is illustrative only, never "
+    "exhaustive) is its OWN independent field, no matter how close together "
+    "their labels and numbers are printed, and no matter what either one is "
+    "called. For each one, find its OWN printed label first — whatever "
+    "language or abbreviation it uses — then read ONLY the number vertically "
+    "aligned with that exact label on its own row — never a neighboring "
+    "label's number, even when the rows sit immediately next to each other. "
+    "A delivery/carriage-type charge is NEVER the same concept as a tax/levy/"
+    "duty-type charge, whatever either is named on THIS document — never "
+    "copy one labeled amount into a different labeled field, and never fill "
+    "one from the other just because one of them has no printed number of "
+    "its own. A blank row next to a populated neighboring row is evidence "
+    "that the blank one is genuinely null, not evidence that it shares the "
+    "neighbor's value — output null for it rather than a copied/guessed "
+    "number. When a page image is available, re-trace each label's row "
+    "visually (left to right) instead of relying on linear OCR text order, "
+    "which can lose the vertical column alignment a totals block depends "
+    "on.\n"
+    "- Optional document-type field (added 2026-11-12): when the primary "
+    "document's type is clearly identifiable, ALSO include a top-level "
+    "\"document_type\" field set to one of INVOICE, CREDIT_NOTE, RECEIPT, "
+    "PURCHASE_ORDER, PACKING_SLIP, or OTHER — in addition to, never instead "
+    "of, every other field you would otherwise extract. Leave this field "
+    "out entirely if the type is genuinely unclear, rather than guessing."
 )
 
 def _wants_json(question: str) -> bool:
@@ -1324,6 +1422,13 @@ class _VLLMScheduler:
         _wait_ms = int((time.time() - _t0) * 1000)
         if _wait_ms > 50:   # skip logging the common case (admitted immediately)
             log.info(f"TIMING | admission_wait_ms={_wait_ms} | class={cls}")
+        # This -- not the inbound HTTP request merely arriving (see
+        # require_api_key) -- is what "recently active" should mean for the
+        # keep-alive loop: a slot was just granted, i.e. a real vLLM call is
+        # about to go out. A request that is itself stuck cold must not be
+        # able to mask that coldness from the keep-alive.
+        global _last_request_ts
+        _last_request_ts = time.time()
 
     async def release(self, cls: str):
         cls = cls if cls in self._reserved else "DOCUMENT"
@@ -2614,8 +2719,32 @@ _PRICE_KEYS  = ("unit_price", "price", "rate")
 _AMOUNT_KEYS = ("amount", "total", "line_total", "total_amount")
 _DESC_KEYS   = ("description", "desc", "item_description")
 _ITEM_KEYS   = ("item_number", "item_code", "item", "sku", "part_number")
-_TOTAL_KEYS  = ("total", "balance_due", "grand_total")
-_TAX_KEYS    = ("sales_tax", "tax", "tax_total", "tax_amount", "vat", "gst")
+_UNIT_KEYS   = ("unit", "uom", "unit_of_measure", "pack_unit")
+# Units that mean "priced per individual piece" — quantity * unit_price is
+# expected to equal amount for these, same as when no unit is printed at
+# all. Anything else present (CW, RL, C, M, BX, CS, DZ, CTN, PL, ...) means
+# the printed price is per PACK/billing-unit, not per piece, so the row's
+# raw quantity (usually a piece count) times that price is NOT expected to
+# reconcile with amount without knowing the pack size — that is a fact
+# about the document, not a validation failure.
+_PER_PIECE_UNITS = {"EA", "EACH", "PC", "PCS", "PIECE", "PIECES", "UNIT", "UNITS"}
+_TOTAL_KEYS  = ("total", "balance_due", "grand_total", "total_due", "amount_due")
+# Aliases for the pre-tax base amount — "subtotal" is the common one, but
+# "net_amount" shows up just as often (esp. CA/intl invoices), and a
+# single-line-item invoice sometimes states it as "amount_before_tax".
+_SUBTOTAL_KEYS = ("subtotal", "net_amount", "subtotal_amount", "amount_before_tax")
+# Every one of these can appear AT THE SAME TIME on one document (e.g. a
+# Quebec invoice showing both gst and qst) — unlike _first()'s single-match
+# lookup elsewhere, the total_mismatch check below sums ALL of these that
+# are present, rather than reading just the first match and silently
+# ignoring the rest.
+_TAX_KEYS    = ("sales_tax", "tax", "tax_total", "tax_amount", "vat", "gst", "qst", "hst", "pst")
+# Totals-block charges that add to the total but are never a tax and never
+# a line item of their own (freight/shipping is extremely common and was
+# the exact field a documented extraction bug kept mis-assigning — this
+# list exists so total_mismatch actually has a chance to catch that class
+# of error instead of silently ignoring the field).
+_CHARGE_KEYS = ("freight", "shipping", "shipping_charge", "shipping_and_handling", "handling")
 # Repair/service invoices often break a row's charge into parts instead of
 # stating one amount (e.g. labor + parts + sublet) — recognized so those
 # rows are still found and reconciled against the stated subtotal.
@@ -2673,10 +2802,10 @@ def _find_totals(data: dict) -> dict:
     there first before looking for a nested "totals"-shaped dict."""
     if not isinstance(data, dict):
         return {}
-    if any(k in data for k in ("subtotal",) + _TOTAL_KEYS):
+    if any(k in data for k in _SUBTOTAL_KEYS + _TOTAL_KEYS):
         return data
     for v in data.values():
-        if isinstance(v, dict) and any(k in v for k in ("subtotal",) + _TOTAL_KEYS):
+        if isinstance(v, dict) and any(k in v for k in _SUBTOTAL_KEYS + _TOTAL_KEYS):
             return v
     return {}
 
@@ -3037,6 +3166,19 @@ def validate_extraction(data, ocr_text: str = "", raw_answer: str = "") -> dict:
     for i, it in enumerate(items):
         qty, price, amt = (_num(_first(it, k)) for k in (_QTY_KEYS, _PRICE_KEYS, _AMOUNT_KEYS))
         if qty is not None and price is not None and amt is not None:
+            unit = str(_first(it, _UNIT_KEYS) or "").strip().upper()
+            if unit and unit not in _PER_PIECE_UNITS:
+                # Pack-priced row (e.g. "$132.00 / CW", "$81.30 / RL") — never
+                # hard-fail this. Flagging it would push _self_correct() to
+                # "fix" the row by rewriting unit_price to amount/quantity,
+                # which silently converts a printed pack price into a
+                # fabricated per-piece one — exactly the bug this exists to
+                # prevent. Reconciling pack price x quantity against amount
+                # requires knowing the pack size, which isn't deterministically
+                # knowable here; the extraction prompt instead asks the model
+                # to flag a genuine mismatch itself via review_required/note
+                # on the row, without ever touching the printed values.
+                continue
             expected = round(qty * price, 2)
             matches_multiplied = abs(expected - round(amt, 2)) <= max(0.02, expected * 0.01)
             matches_unit_price = abs(round(price, 2) - round(amt, 2)) <= max(0.02, price * 0.01)
@@ -3082,7 +3224,7 @@ def validate_extraction(data, ocr_text: str = "", raw_answer: str = "") -> dict:
     # AND line_sum plus any such totals-only components before calling it a
     # genuine mismatch.
     fee_extra = sum(_num(totals.get(k)) or 0 for k in _EXTRA_FEE_KEYS if k in totals)
-    subtotal = _num(totals.get("subtotal")) if totals else None
+    subtotal = _num(_first(totals, _SUBTOTAL_KEYS)) if totals else None
     if items and subtotal is not None:
         candidates = (line_sum, line_sum + fee_extra)
         if not any(abs(c - subtotal) <= max(0.05, subtotal * 0.01) for c in candidates):
@@ -3090,11 +3232,48 @@ def validate_extraction(data, ocr_text: str = "", raw_answer: str = "") -> dict:
                            "detail": f"line items sum to {round(line_sum, 2)}, but stated subtotal is {subtotal}"})
     total = _num(_first(totals, _TOTAL_KEYS)) if totals else None
     if subtotal is not None and total is not None:
-        tax = _num(_first(totals, _TAX_KEYS)) or 0
-        if abs((subtotal + tax) - total) > max(0.05, total * 0.01):
+        # Sum EVERY matching tax/charge key present, not just the first —
+        # a document can legitimately have more than one (e.g. gst + qst),
+        # and silently reading only one left freight/a second tax field
+        # completely unchecked, which is exactly how a mis-assigned
+        # freight value (duplicating an adjacent tax field) slipped past
+        # this check on every prior run.
+        tax    = sum(_num(totals.get(k)) or 0 for k in _TAX_KEYS if k in totals)
+        charge = sum(_num(totals.get(k)) or 0 for k in _CHARGE_KEYS if k in totals)
+        expected_total = subtotal + tax + charge
+        if abs(expected_total - total) > max(0.05, total * 0.01):
             issues.append({"type": "total_mismatch", "severity": "hard",
-                           "detail": f"subtotal {subtotal} + tax {tax} = {round(subtotal + tax, 2)}, "
-                                     f"but stated total is {total}"})
+                           "detail": f"subtotal {subtotal} + tax {round(tax, 2)} + charges {round(charge, 2)} "
+                                     f"= {round(expected_total, 2)}, but stated total is {total} — check for "
+                                     f"a duplicated/misassigned value between the tax and charge fields"})
+
+    # 4c. charge_tax_duplicate (hard, added 2026-11-12) — a charge field
+    # (freight/shipping/...) whose value exactly equals a tax field's value
+    # (gst/qst/hst/pst/vat/...) is the known duplication-bug signature (see
+    # the _CHARGE_KEYS comment above). This fires independently of
+    # total_mismatch above (which only catches it when the duplication also
+    # throws off the printed total) so it still flags the case where the
+    # printed total itself was back-filled to match the duplicated value, or
+    # subtotal/total aren't both present to run that check at all. Named
+    # explicitly in the detail so the self-correction pass gets an
+    # unambiguous target instead of just "the total doesn't match".
+    if totals:
+        for charge_key in _CHARGE_KEYS:
+            charge_val = _num(totals.get(charge_key))
+            if not charge_val:
+                continue
+            for tax_key in _TAX_KEYS:
+                tax_val = _num(totals.get(tax_key))
+                if tax_val is not None and abs(charge_val - tax_val) < 0.005:
+                    issues.append({"type": "charge_tax_duplicate", "severity": "hard",
+                                   "detail": f"{charge_key} ({charge_val}) exactly matches {tax_key} "
+                                             f"({tax_val}) — this is very likely the known bug where a "
+                                             f"tax amount gets copied into a charge field. Re-check the "
+                                             f"document: does {charge_key} have its OWN printed number on "
+                                             f"its own row, distinct from {tax_key}'s row? If {charge_key} "
+                                             f"has no printed number of its own, set it to null — do not "
+                                             f"leave it equal to {tax_key}."})
+                    break  # one flag per charge field is enough
 
     # 4b. subtotal_as_line_item (hard) — a row whose amount equals the
     # invoice subtotal is usually the subtotal itself leaking into the table
@@ -3384,6 +3563,64 @@ def _push_critical(parsed: dict, voted: dict) -> None:
                     totals[k] = v
                     break
 
+# Field names that represent "the final payable amount" — the one numeric
+# concept virtually every real invoice prints somewhere, so it's excluded
+# from the blanket widening below rather than relying on any other fixed
+# per-field name list. Everything else numeric gets widened regardless of
+# what it's called, which country/language/tax system it belongs to, or
+# whether it was anticipated here by name at all — a document can name its
+# charges/taxes/levies anything (GST, IVA, Handling Fee, Environmental Levy,
+# ...), and this must not depend on recognizing that name.
+_ALWAYS_PRESENT_NUMERIC_FIELDS = frozenset(_TOTAL_KEYS)
+
+def _widen_schema_nullability(schema, _depth: int = 0):
+    """Confirmed live 2026-11-12: a caller-supplied `output_schema` (guided/
+    constrained decoding via vLLM's json_schema response_format) that types
+    a property like "freight" as a plain required "number" makes it
+    STRUCTURALLY IMPOSSIBLE for the model to emit null for it — unlike free-
+    text generation, the grammar simply has no null token available there.
+    Forced to substitute a real number for a field its own reasoning had
+    correctly determined should be null, the model's output cascaded:
+    freight took gst's value, gst took qst's, qst took the total's — every
+    later property shifted to fill the gap. No prompt wording fixes this;
+    it's a decoding-grammar constraint, not a reasoning failure. Reproduced
+    with a direct vLLM call: a required non-nullable "freight" property
+    produced {"freight": 139.00 (should be null), "gst": 277.31 (should be
+    139.00), "qst": 3196.31 (should be 277.31), ...}; the identical request
+    with "freight" typed ["number", "null"] produced the fully correct
+    {"freight": null, "gst": 139.00, "qst": 277.31, "total_due": 3196.31}.
+    DELIBERATELY NAME-AGNOSTIC (not a fixed GST/HST/PST/freight list) — any
+    type of invoice, from any country, can call its charges/taxes/levies
+    anything, so this widens EVERY number/integer-typed property in a
+    CALLER-SUPPLIED schema to also accept null, recursively through nested
+    "properties"/"items", except the one concept that's virtually always
+    genuinely printed on a real invoice: the final payable total (see
+    _ALWAYS_PRESENT_NUMERIC_FIELDS). This can only make the caller's schema
+    LESS strict (accept one more value for fields that may legitimately be
+    blank on any given document), never rejects anything it previously
+    accepted, and never touches a property name this schema didn't already
+    define."""
+    if _depth > 6 or not isinstance(schema, dict):
+        return schema
+    props = schema.get("properties")
+    if isinstance(props, dict):
+        for name, sub in props.items():
+            if not isinstance(sub, dict):
+                continue
+            t = sub.get("type")
+            is_numeric = t == "number" or t == "integer" or (
+                isinstance(t, list) and any(x in ("number", "integer") for x in t))
+            if is_numeric and name not in _ALWAYS_PRESENT_NUMERIC_FIELDS:
+                if isinstance(t, str) and t != "null":
+                    sub["type"] = [t, "null"]
+                elif isinstance(t, list) and "null" not in t:
+                    sub["type"] = [*t, "null"]
+            _widen_schema_nullability(sub, _depth + 1)
+    items = schema.get("items")
+    if isinstance(items, dict):
+        _widen_schema_nullability(items, _depth + 1)
+    return schema
+
 @app.post("/v1/extract")
 async def batch_extract(request: Request,
                         files: list[UploadFile] = File(...),
@@ -3418,6 +3655,11 @@ async def batch_extract(request: Request,
         except json.JSONDecodeError as e:
             return JSONResponse(status_code=400, content={"error": {
                 "message": f"`output_schema` is not valid JSON: {e}"}})
+        # Added 2026-11-12 — see _widen_schema_nullability's docstring: a
+        # caller's schema requiring a non-nullable freight/tax/charge field
+        # forces guided decoding to corrupt that field and every one after
+        # it when the document genuinely has no value there.
+        parsed_schema = _widen_schema_nullability(parsed_schema)
         response_format = {"type": "json_schema", "json_schema": {"name": "extraction", "schema": parsed_schema}}
 
     # Optional self-consistency: run the extraction N times and majority-vote
@@ -4035,17 +4277,20 @@ async def _detect_task(messages: list) -> str:
             "chat - general conversation, questions, writing, everything else"},
         {"role": "user", "content": question[:1500]},
     ]
+    _t_classify0 = time.time()
     try:
         body = {"model": MODEL, "messages": judge, "max_tokens": 4,
                 "temperature": 0, "chat_template_kwargs": {"enable_thinking": False}}
         async with httpx.AsyncClient(timeout=20) as c, _vllm_sched.slot("CHAT"):
             r = await c.post(f"{VLLM_URL}/v1/chat/completions", json=body)
             ans = r.json()["choices"][0]["message"].get("content", "").strip().lower()
+        log.info(f"TIMING | classifier_ms={int((time.time() - _t_classify0) * 1000)}")
         for t in TASK_PRESETS:
             if t in ans:
                 return t
     except Exception as e:
-        log.warning(f"task classifier failed: {e}")
+        log.warning(f"task classifier failed: {e} | "
+                    f"classifier_ms={int((time.time() - _t_classify0) * 1000)}")
     return "chat"
 
 @app.post("/v1/chat/completions")
@@ -4065,19 +4310,26 @@ async def chat_completions(request: Request):
     # Explicit client params ALWAYS win; auto never reduces max_tokens.
     # Smart OCR routing (2026-10-13), additive and opt-in: "ocr_mode" body
     # field or X-OCR-Mode header selects how inline images are handled.
-    # Absent/"inline" (and no "skip_ocr") -> _resolve_images(), byte-for-byte
-    # the original behavior (OCR awaited before the prompt is built, text
-    # injected). "skip_ocr": true is kept as an alias for ocr_mode="off".
-    _skip_ocr_alias = bool(body.pop("skip_ocr", False))
+    # Default is "off" -- the model is vision-capable (qwen3-VL), so every
+    # image call uses vision directly via _resolve_images_routed() and skips
+    # the PaddleOCR microservice pool entirely, unless a client explicitly
+    # asks for "inline"/"auto"/"separate". "skip_ocr": true is kept as an
+    # explicit alias for ocr_mode="off" (now also the implicit default).
+    body.pop("skip_ocr", None)   # pre-smart-routing alias, now a no-op (default is already "off")
     _ocr_mode = str(body.pop("ocr_mode", "") or request.headers.get("x-ocr-mode") or "").strip().lower()
     if not _ocr_mode:
-        _ocr_mode = "off" if _skip_ocr_alias else "inline"
+        _ocr_mode = "off"
     if _ocr_mode not in ("inline", "off", "auto", "separate"):
-        _ocr_mode = "inline"
+        _ocr_mode = "off"
+    # jeeva's calls must never reach the OCR pool, even if its own client
+    # code explicitly requests inline/auto/separate -- hard override, after
+    # the client/header value is resolved, so nothing can turn OCR back on
+    # for this key. Every other key keeps the behavior above untouched.
+    if getattr(request.state, "user", "") == "jeeva":
+        _ocr_mode = "off"
 
     _ocr_task = None
     _ocr_image_meta: list[dict] = []
-    # text-only model: OCR any inline images first so vision-format requests work
     if isinstance(body.get("messages"), list):
         if _ocr_mode == "inline":
             body["messages"], img_resolved = await _resolve_images(body["messages"])
